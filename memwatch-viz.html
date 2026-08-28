@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>memwatch — build memory forensics</title>
+
+    <!-- d3 as a plain global. To work offline, drop d3.min.js next to this
+         file (https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js) and change
+         this src to "d3.min.js". Nothing else is needed. -->
+    <script src="./d3.min.js"></script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <link rel="stylesheet" href="memwatch.css">
+  </head>
+
+  <body>
+    <div class="app" id="app">
+      <header class="bar">
+        <div class="bar__id">
+          <span class="bar__mark" aria-hidden="true"></span>
+          <h1>memwatch</h1>
+          <span class="bar__sub" id="run-label">no run loaded</span>
+        </div>
+        <div class="bar__tools">
+          <div class="grouping" role="group" aria-label="Group processes by">
+            <button type="button" data-group="comm" class="is-on">by name</button>
+            <button type="button" data-group="pid">by pid</button>
+          </div>
+          <label class="pick">
+            <input type="file" id="file-system" accept=".csv" />
+            <span>system.csv</span>
+          </label>
+          <label class="pick">
+            <input type="file" id="file-procs" accept=".csv" />
+            <span>procs.csv</span>
+          </label>
+        </div>
+      </header>
+
+      <section class="readout" id="readout" aria-live="polite">
+        <div class="readout__cell">
+          <span class="readout__k">at cursor</span>
+          <span class="readout__v" id="ro-time">—</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__k">in use</span>
+          <span class="readout__v" id="ro-used">—</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__k">available</span>
+          <span class="readout__v" id="ro-avail">—</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__k">swap used</span>
+          <span class="readout__v" id="ro-swap">—</span>
+        </div>
+        <div class="readout__cell">
+          <span class="readout__k">load</span>
+          <span class="readout__v" id="ro-load">—</span>
+        </div>
+        <div class="readout__cell readout__cell--pin">
+          <span class="readout__k">tightest moment</span>
+          <span class="readout__v" id="ro-worst">—</span>
+        </div>
+      </section>
+
+      <main class="grid">
+        <section class="panel panel--chart">
+          <div class="panel__head">
+            <h2>Resident memory by process</h2>
+            <p class="panel__note" id="chart-note">Move across the plot to read any moment.</p>
+          </div>
+          <div class="plot" id="plot"></div>
+          <div class="nav" id="nav"></div>
+          <p class="hint">Drag the strip below the plot to zoom a time range. Double-click it to reset.</p>
+        </section>
+
+        <section class="panel panel--table">
+          <div class="panel__head">
+            <h2>Processes</h2>
+            <p class="panel__note"><span id="table-count">—</span></p>
+          </div>
+          <div class="tablewrap">
+            <table class="ptable" id="ptable">
+              <thead>
+                <tr>
+                  <th class="col-name" data-sort="label" scope="col">process</th>
+                  <th class="col-num" data-sort="cursor" scope="col">at cursor</th>
+                  <th class="col-num is-sorted" data-sort="peak" scope="col">peak</th>
+                  <th class="col-num" data-sort="conc" scope="col">max n</th>
+                </tr>
+              </thead>
+              <tbody id="ptable-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+
+      <div class="empty" id="empty">
+        <div class="empty__inner">
+          <h2>Drop a memwatch run here</h2>
+          <p>
+            Drag <code>system.csv</code> and <code>procs.csv</code> onto this window, or pick them
+            from the bar above. Both files are written into the run directory by
+            <code>memwatch.sh</code>. Nothing leaves your machine.
+          </p>
+          <p class="empty__alt">
+            Serving this page from a run directory loads those two files automatically.
+          </p>
+        </div>
+      </div>
+    </div>
+    <script src="./memwatch.js"></script>
+  </body>
+</html>

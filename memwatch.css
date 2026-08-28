@@ -1,0 +1,600 @@
+/* memwatch viz — instrument panel in low light.
+    Ground is a deep petrol slate rather than black; amber is the only
+    warning hue; the series palette carries all other colour. */
+
+:root {
+  --ground: #0e141a;
+  --panel: #141d25;
+  --panel-2: #19242e;
+  --rule: #24333f;
+  --rule-soft: #1c2831;
+  --ink: #ccdae3;
+  --ink-dim: #7d95a4;
+  --ink-faint: #4c6473;
+  --warn: #e2a63c;
+  --warn-wash: rgba(226, 166, 60, 0.11);
+  --crit: #e2635a;
+
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --cond: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+
+  --r: 3px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: 2px;
+}
+
+.app {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+  position: relative;
+}
+
+/* ------------------------------------------------------------ top bar */
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--panel);
+}
+
+.bar__id {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bar__mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(226, 166, 60, 0.15);
+  align-self: center;
+  flex: none;
+}
+
+.bar h1 {
+  font-family: var(--cond);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin: 0;
+}
+
+.bar__sub {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar__tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.grouping {
+  display: flex;
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+
+.grouping button {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 5px 10px;
+  background: transparent;
+  color: var(--ink-dim);
+  border: 0;
+  cursor: pointer;
+}
+
+.grouping button + button {
+  border-left: 1px solid var(--rule);
+}
+
+.grouping button:hover {
+  color: var(--ink);
+  background: var(--panel-2);
+}
+
+.grouping button.is-on {
+  color: var(--ground);
+  background: var(--ink-dim);
+}
+
+.pick {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.pick input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.pick span {
+  font-size: 11.5px;
+  padding: 5px 11px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  color: var(--ink-dim);
+  background: var(--panel-2);
+}
+
+.pick:hover span,
+.pick input:focus-visible + span {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.pick.is-set span {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.pick.is-set span::before {
+  content: "\2713\00a0";
+  color: var(--warn);
+}
+
+/* ------------------------------------------------------------ readout */
+
+.readout {
+  display: flex;
+  gap: 2px;
+  padding: 0 18px;
+  background: var(--ground);
+  border-bottom: 1px solid var(--rule);
+  overflow-x: auto;
+}
+
+.readout__cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 20px 9px 0;
+  min-width: 118px;
+}
+
+.readout__cell--pin {
+  margin-left: auto;
+  padding-left: 20px;
+  border-left: 1px solid var(--rule-soft);
+  text-align: right;
+}
+
+.readout__k {
+  font-size: 10px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.readout__v {
+  font-size: 15px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.readout__v.is-low {
+  color: var(--warn);
+}
+
+.readout__cell--pin .readout__v {
+  color: var(--warn);
+  cursor: pointer;
+}
+
+/* ------------------------------------------------------------- layout */
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 27%);
+  gap: 1px;
+  background: var(--rule);
+  min-height: 0;
+}
+
+.panel {
+  background: var(--ground);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px 8px;
+}
+
+.panel__head h2 {
+  font-family: var(--cond);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  margin: 0;
+}
+
+.panel__note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-family: var(--sans);
+}
+
+.plot {
+  flex: 1;
+  min-height: 220px;
+  padding: 0 8px 0 4px;
+}
+
+.nav {
+  height: 76px;
+  padding: 0 8px 4px 4px;
+}
+
+.hint {
+  margin: 0;
+  padding: 0 18px 12px;
+  font-family: var(--sans);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+/* -------------------------------------------------------------- chart */
+
+.plot svg,
+.nav svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.axis text {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  fill: var(--ink-faint);
+}
+
+.axis .domain {
+  display: none;
+}
+
+.axis line {
+  stroke: var(--rule-soft);
+}
+
+.gridline {
+  stroke: var(--rule-soft);
+  stroke-dasharray: 1 4;
+}
+
+.limit {
+  stroke: var(--ink-faint);
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+  fill: none;
+}
+
+.limit-label {
+  font-size: 10px;
+  fill: var(--ink-faint);
+  letter-spacing: 0.06em;
+}
+
+.lowband {
+  fill: var(--warn-wash);
+}
+
+.worstline {
+  stroke: var(--warn);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.worst-tag {
+  font-size: 10px;
+  fill: var(--warn);
+  letter-spacing: 0.08em;
+}
+
+.layer {
+  cursor: pointer;
+}
+
+.layer.is-muted {
+  opacity: 0.16;
+}
+
+.cursorline {
+  stroke: var(--ink);
+  stroke-width: 1;
+  opacity: 0.55;
+}
+
+.cursordot {
+  fill: none;
+  stroke-width: 1.5;
+}
+
+.navarea {
+  fill: #3c4d5a;
+  opacity: 0.5;
+}
+
+.navswap {
+  fill: none;
+  stroke: var(--crit);
+  stroke-width: 1.25;
+}
+
+.nav .selection {
+  fill: rgba(204, 218, 227, 0.09);
+  stroke: var(--ink-faint);
+  shape-rendering: crispEdges;
+}
+
+.nav .handle {
+  fill: var(--ink-faint);
+}
+
+.navlabel {
+  font-size: 9.5px;
+  fill: var(--ink-faint);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* -------------------------------------------------------------- table */
+
+.tablewrap {
+  flex: 1;
+  overflow: auto;
+  border-top: 1px solid var(--rule-soft);
+  min-height: 0;
+}
+
+.ptable {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.ptable thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  border-bottom: 1px solid var(--rule);
+  font-weight: 500;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  text-align: right;
+  padding: 7px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ptable thead th.col-name {
+  text-align: left;
+}
+
+.ptable thead th:hover {
+  color: var(--ink-dim);
+}
+
+.ptable thead th.is-sorted {
+  color: var(--ink);
+}
+
+.ptable thead th.is-sorted::after {
+  content: " \25be";
+}
+
+.ptable tbody tr {
+  cursor: pointer;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.ptable tbody tr:hover,
+.ptable tbody tr.is-picked {
+  background: var(--panel-2);
+}
+
+.ptable tbody tr.is-dim {
+  opacity: 0.34;
+}
+
+.ptable td {
+  padding: 6px 12px;
+  text-align: right;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.ptable td.col-name {
+  text-align: left;
+  width: 100%;
+  max-width: 0;
+  position: relative;
+}
+
+/* the bar behind a name is that process's share of the cursor moment */
+.namebar {
+  position: absolute;
+  inset: 1px auto 1px 0;
+  border-radius: 0 2px 2px 0;
+  opacity: 0.22;
+  pointer-events: none;
+  transition: width 90ms linear;
+}
+
+.nameinner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+  flex: none;
+}
+
+.pname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.pcmd {
+  display: block;
+  position: relative;
+  font-family: var(--sans);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 16px;
+}
+
+.ptable td.col-num.is-zero {
+  color: var(--ink-faint);
+}
+
+/* -------------------------------------------------------------- empty */
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(14, 20, 26, 0.94);
+  z-index: 5;
+  padding: 24px;
+}
+
+.empty.is-hidden {
+  display: none;
+}
+
+.app.is-dragging .empty {
+  display: grid;
+  background: rgba(14, 20, 26, 0.97);
+  box-shadow: inset 0 0 0 2px var(--warn);
+}
+
+.empty__inner {
+  max-width: 460px;
+  text-align: center;
+}
+
+.empty__inner h2 {
+  font-family: var(--cond);
+  font-size: 20px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 0 0 12px;
+}
+
+.empty__inner p {
+  font-family: var(--sans);
+  color: var(--ink-dim);
+  line-height: 1.55;
+  margin: 0 0 10px;
+}
+
+.empty__alt {
+  font-size: 12px;
+  color: var(--ink-faint) !important;
+}
+
+.empty code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+
+.err {
+  margin-top: 14px;
+  color: var(--crit);
+  font-size: 12px;
+  font-family: var(--sans);
+}
+
+/* ------------------------------------------------------------- narrow */
+
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(320px, 1fr) minmax(240px, 0.8fr);
+    overflow: auto;
+  }
+  .readout__cell--pin {
+    margin-left: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
