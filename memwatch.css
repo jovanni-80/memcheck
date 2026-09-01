@@ -137,6 +137,25 @@ body {
   background: var(--ink-dim);
 }
 
+.bands {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.bands select {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 6px;
+  color: var(--ink);
+  background: var(--panel-2);
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  cursor: pointer;
+}
+
 .pick {
   position: relative;
   overflow: hidden;
@@ -269,14 +288,20 @@ body {
 }
 
 .plot {
+  position: relative;
   flex: 1;
   min-height: 220px;
-  padding: 0 8px 0 4px;
+  padding: 0;
 }
 
 .nav {
   height: 76px;
   padding: 0 8px 4px 4px;
+}
+
+.hint code {
+  font-family: var(--mono);
+  color: var(--ink-dim);
 }
 
 .hint {
@@ -285,6 +310,80 @@ body {
   font-family: var(--sans);
   font-size: 10.5px;
   color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------ tooltip */
+
+.tip {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  min-width: 150px;
+  padding: 7px 9px 8px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.tip__t {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.tip__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.tip__k {
+  color: var(--ink-dim);
+}
+
+.tip__v {
+  font-weight: 500;
+}
+
+.tip__v.is-low {
+  color: var(--warn);
+}
+
+.tip__band {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--rule-soft);
+}
+
+.tip__sw {
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+  flex: none;
+}
+
+.tip__name {
+  color: var(--ink-dim);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tip__bv {
+  margin-left: auto;
+  font-weight: 500;
+  padding-left: 10px;
 }
 
 /* -------------------------------------------------------------- chart */
@@ -331,6 +430,14 @@ body {
 
 .lowband {
   fill: var(--warn-wash);
+}
+
+.usedline {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 1.1;
+  stroke-dasharray: 6 3;
+  opacity: 0.5;
 }
 
 .worstline {

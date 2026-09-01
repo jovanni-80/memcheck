@@ -8,7 +8,7 @@
     <!-- d3 as a plain global. To work offline, drop d3.min.js next to this
          file (https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js) and change
          this src to "d3.min.js". Nothing else is needed. -->
-    <script src="./d3.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -16,7 +16,6 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500&display=swap"
       rel="stylesheet"
     />
-
     <link rel="stylesheet" href="memwatch.css">
   </head>
 
@@ -33,6 +32,15 @@
             <button type="button" data-group="comm" class="is-on">by name</button>
             <button type="button" data-group="pid">by pid</button>
           </div>
+          <label class="bands">
+            bands
+            <select id="band-count">
+              <option value="8">8</option>
+              <option value="12" selected>12</option>
+              <option value="20">20</option>
+              <option value="24">24</option>
+            </select>
+          </label>
           <label class="pick">
             <input type="file" id="file-system" accept=".csv" />
             <span>system.csv</span>
@@ -79,7 +87,10 @@
           </div>
           <div class="plot" id="plot"></div>
           <div class="nav" id="nav"></div>
-          <p class="hint">Drag the strip below the plot to zoom a time range. Double-click it to reset.</p>
+          <p class="hint">
+            Dashed overlay is <code>MemTotal &minus; MemAvailable</code>, what the kernel says is in
+            use — the stack should track it. Drag the strip below the plot to zoom; double-click to reset.
+          </p>
         </section>
 
         <section class="panel panel--table">
@@ -117,6 +128,6 @@
         </div>
       </div>
     </div>
-    <script src="./memwatch.js"></script>
+    <script src="./memwatch.js" > </script>
   </body>
 </html>

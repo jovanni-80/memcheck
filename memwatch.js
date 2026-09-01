@@ -1,14 +1,16 @@
 "use strict";
 
 /* ==================================================================
-   data — CSV parsing, grouping, and the stack model
-   ================================================================== */
+    data — CSV parsing, grouping, and the stack model
+    ================================================================== */
 
 /* Palette: warm-to-cool spread that stays separable on the petrol
-   ground. Ordered so the largest consumer takes the strongest teal. */
+    ground. Ordered so the largest consumer takes the strongest teal. */
 var PALETTE = [
   "#4fc3b0", "#e8a33d", "#7ea6f0", "#c98be0", "#e2757f", "#86c765",
   "#5fb8d8", "#dcc45e", "#a58cf0", "#e0894f", "#6fd3a0", "#d47ab3",
+  "#8fb4c9", "#e0a58c", "#9fd07a", "#b39ae0", "#e08fa0", "#6ec2c9",
+  "#c9b06e", "#7f9fe0", "#a0d8c0", "#d9a0d0", "#c2c96e", "#8ec4e8",
 ];
 
 function num(v) {
@@ -26,6 +28,12 @@ function parseSystem(text) {
     var memAvail = num(r.mem_avail_kb);
     var swapTotal = num(r.swap_total_kb);
     var swapFree = num(r.swap_free_kb);
+    // shmem/slab/pagetables arrived in a later version of the sampler;
+    // older runs simply report them as zero
+    var shmem = num(r.shmem_kb);
+    var slab = num(r.slab_kb);
+    var pagetables = num(r.pagetables_kb);
+    var kstack = num(r.kernelstack_kb);
     out.push({
       iso: r.iso || "",
       time: new Date(epoch * 1000),
@@ -43,6 +51,18 @@ function parseSystem(text) {
       load1: num(r.load1),
       procsRunning: num(r.procs_running),
       low: r.low === "1",
+      shmem: shmem,
+      slab: slab,
+      sreclaimable: num(r.sreclaimable_kb),
+      sunreclaim: num(r.sunreclaim_kb),
+      pagetables: pagetables,
+      kstack: kstack,
+      anon: num(r.anon_kb),
+      mapped: num(r.mapped_kb),
+      hugetlb: num(r.hugetlb_kb),
+      procsLogged: num(r.procs_logged),
+      metric: r.metric || "rss",
+      kernel: shmem + slab + pagetables + kstack,
       used: Math.max(0, memTotal - memAvail),
       swapUsed: Math.max(0, swapTotal - swapFree),
     });
@@ -53,191 +73,322 @@ function parseSystem(text) {
   return out;
 }
 
-/** procs.csv → one record per process observed at one moment. */
+function emptyProcs() {
+  return { n: 0, epoch: null, idIdx: null, rss: null, vsz: null, ids: [] };
+}
+
+/**
+  * procs.csv → columnar typed arrays.
+  *
+  * Logging every process means hundreds of thousands of rows, so this
+  * avoids one object per row. Identity (comm/ppid/cmdline) is written by
+  * the sampler only when a pid first appears, so it is filled forward
+  * here; a pid that comes back under a different comm gets a fresh
+  * identity rather than inheriting the dead process's name.
+  *
+  * Handles both the old wide layout and the current compact one by
+  * looking columns up by name.
+  */
 function parseProcs(text) {
-  var out = [];
-  d3.csvParse(text).forEach(function (r) {
-    var epoch = num(r.epoch);
-    if (!epoch) return;
-    out.push({
-      epoch: epoch,
-      pid: num(r.pid),
-      ppid: num(r.ppid),
-      rss: num(r.rss_kb),
-      vsz: num(r.vsz_kb),
-      comm: r.comm || "?",
-      cmdline: r.cmdline || "",
-    });
+  var nl = text.indexOf("\n");
+  if (nl < 0) return emptyProcs();
+  var header = d3.csvParseRows(text.slice(0, nl))[0].map(function (h) {
+    return h.trim();
   });
-  return out;
+  var col = {};
+  header.forEach(function (h, i) {
+    col[h] = i;
+  });
+  var iEpoch = col.epoch, iPid = col.pid, iRss = col.rss_kb,
+    iVsz = col.vsz_kb, iComm = col.comm, iPpid = col.ppid, iCmd = col.cmdline;
+  if (iEpoch === undefined || iPid === undefined || iRss === undefined) {
+    return emptyProcs();
+  }
+
+  var cap = Math.max(1024, Math.ceil(text.length / 26));
+  var epoch = new Float64Array(cap);
+  var idIdx = new Int32Array(cap);
+  var rss = new Float64Array(cap);
+  var vsz = new Float64Array(cap);
+  var n = 0;
+
+  var ids = [];
+  var live = new Map(); // pid -> index into ids
+
+  function grow() {
+    cap *= 2;
+    var a = new Float64Array(cap); a.set(epoch); epoch = a;
+    var b = new Int32Array(cap); b.set(idIdx); idIdx = b;
+    var c = new Float64Array(cap); c.set(rss); rss = c;
+    var d = new Float64Array(cap); d.set(vsz); vsz = d;
+  }
+
+  d3.csvParseRows(text, function (row, i) {
+    if (i === 0) return null;
+    var e = +row[iEpoch];
+    if (!e) return null;
+    var pid = +row[iPid];
+    var comm = iComm === undefined ? "" : row[iComm] || "";
+
+    var idx = live.has(pid) ? live.get(pid) : -1;
+    if (comm !== "" && (idx < 0 || ids[idx].comm !== comm)) {
+      // first sighting, or this pid has been recycled onto another program
+      idx = ids.length;
+      ids.push({
+        pid: pid,
+        comm: comm,
+        ppid: iPpid === undefined ? 0 : +row[iPpid] || 0,
+        cmdline: iCmd === undefined ? "" : row[iCmd] || "",
+      });
+      live.set(pid, idx);
+    } else if (idx < 0) {
+      // compact row for a pid whose identity row we never saw
+      idx = ids.length;
+      ids.push({ pid: pid, comm: "pid " + pid, ppid: 0, cmdline: "" });
+      live.set(pid, idx);
+    }
+
+    if (n === cap) grow();
+    epoch[n] = e;
+    idIdx[n] = idx;
+    rss[n] = +row[iRss] || 0;
+    vsz[n] = iVsz === undefined ? 0 : +row[iVsz] || 0;
+    n++;
+    return null;
+  });
+
+  return { n: n, epoch: epoch, idIdx: idIdx, rss: rss, vsz: vsz, ids: ids };
 }
 
 /* Shorten a cmdline to the bit that identifies the work: the last
-   path-ish argument, which for a compile is usually the source file. */
+    path-ish argument, which for a compile is usually the source file. */
 function describe(cmdline, comm) {
   if (!cmdline || cmdline === "[" + comm + "]") return "";
   var parts = cmdline.split(/\s+/);
   for (var i = parts.length - 1; i >= 0; i--) {
-    if (/\.(c|C|cc|cpp|cxx|c\+\+|m|mm|ii|s|o|a|so)$/i.test(parts[i])) return parts[i];
+    if (/\.(c|cc|cpp|cxx|c\+\+|m|mm|ii|s|o|a|so)$/i.test(parts[i])) return parts[i];
   }
   return cmdline.length > 90 ? cmdline.slice(0, 90) + "…" : cmdline;
 }
 
+function mkSeries(key, label, detail, color, values, synthetic) {
+  var peak = 0, peakIndex = 0, total = 0, seen = 0;
+  for (var i = 0; i < values.length; i++) {
+    if (values[i] > 0) seen++;
+    total += values[i];
+    if (values[i] > peak) {
+      peak = values[i];
+      peakIndex = i;
+    }
+  }
+  return {
+    key: key, label: label, detail: detail, color: color, values: values,
+    peak: peak, peakIndex: peakIndex, mean: seen ? total / seen : 0,
+    seen: seen, maxConcurrent: 0, synthetic: !!synthetic,
+  };
+}
+
 /**
- * Fold per-sample process rows into aligned series ready to stack.
- *
- * procs.csv only holds the top N processes per sample, so the logged
- * rows never account for all of `used`. The remainder becomes its own
- * band rather than being dropped — otherwise the stack quietly
- * under-reports exactly when the machine is busiest.
- */
+  * Fold per-sample process rows into aligned series ready to stack.
+  *
+  * Two passes, because with every process logged there can be thousands
+  * of distinct keys and a dense per-key array would be gigabytes. Pass
+  * one accumulates scalars only (peak, total, concurrency) to rank the
+  * keys; pass two allocates dense arrays for just the bands that will
+  * actually be drawn, plus one for everything else.
+  */
 function buildModel(samples, procs, groupBy, topN) {
-  topN = topN || 11;
+  topN = topN || 12;
   var n = samples.length;
   var indexOf = new Map();
-  samples.forEach(function (s, i) {
-    indexOf.set(s.epoch, i);
-  });
+  var i, k;
+  for (i = 0; i < n; i++) indexOf.set(samples[i].epoch, i);
 
-  var accs = new Map();
-  procs.forEach(function (p) {
-    var i = indexOf.get(p.epoch);
-    if (i === undefined) return;
-    var key = groupBy === "comm" ? p.comm : p.comm + "·" + p.pid;
-    var a = accs.get(key);
-    if (!a) {
-      a = {
-        key: key,
-        label: groupBy === "comm" ? p.comm : p.comm + " " + p.pid,
-        detail: describe(p.cmdline, p.comm),
-        values: new Float64Array(n),
-        counts: new Int32Array(n),
-        peak: 0,
-        peakIndex: 0,
-        total: 0,
-        seen: 0,
-      };
-      accs.set(key, a);
-    }
-    a.values[i] += p.rss;
-    a.counts[i] += 1;
-    a.total += p.rss;
-    // keep the cmdline of the biggest instance seen, it's the useful one
-    if (p.rss >= a.peak && p.cmdline) a.detail = describe(p.cmdline, p.comm);
-    if (a.values[i] > a.peak) {
-      a.peak = a.values[i];
-      a.peakIndex = i;
-    }
-  });
+  var stats = new Map(); // key -> ranking scalars
+  var rowKey = null;     // key per row, reused in pass two
+  var rowSample = null;
 
-  accs.forEach(function (a) {
-    for (var i = 0; i < n; i++) if (a.values[i] > 0) a.seen++;
-  });
+  if (procs.n) {
+    rowKey = new Int32Array(procs.n);
+    rowSample = new Int32Array(procs.n);
+    var keyIds = [];
+    var keyIndex = new Map();
+    var idKey = new Int32Array(procs.ids.length).fill(-1);
 
-  var ranked = Array.from(accs.values()).sort(function (x, y) {
-    return y.peak - x.peak;
-  });
-  var shown = ranked.slice(0, topN);
-  var rest = ranked.slice(topN);
+    // --- pass one: rank keys without storing anything per sample
+    var curSample = -1;
+    var bucket = new Map(); // key -> summed value within the current sample
+    var bucketN = new Map();
 
-  var series = shown.map(function (a, idx) {
-    var maxC = 0;
-    for (var i = 0; i < n; i++) if (a.counts[i] > maxC) maxC = a.counts[i];
-    return {
-      key: a.key,
-      label: a.label,
-      detail: a.detail,
-      color: PALETTE[idx % PALETTE.length],
-      values: a.values,
-      peak: a.peak,
-      peakIndex: a.peakIndex,
-      mean: a.seen ? a.total / a.seen : 0,
-      seen: a.seen,
-      maxConcurrent: maxC,
-      synthetic: false,
+    var flush = function () {
+      bucket.forEach(function (v, key) {
+        var st = stats.get(key);
+        if (v > st.peak) {
+          st.peak = v;
+          st.peakIndex = curSample;
+        }
+        st.total += v;
+        st.seen++;
+        var c = bucketN.get(key);
+        if (c > st.maxConcurrent) st.maxConcurrent = c;
+      });
+      bucket.clear();
+      bucketN.clear();
     };
-  });
 
-  if (rest.length) {
-    var rv = new Float64Array(n);
-    var rpeak = 0, rpeakIndex = 0, rtotal = 0, rseen = 0;
-    rest.forEach(function (a) {
-      for (var i = 0; i < n; i++) rv[i] += a.values[i];
-    });
-    for (var i = 0; i < n; i++) {
-      if (rv[i] > 0) rseen++;
-      rtotal += rv[i];
-      if (rv[i] > rpeak) {
-        rpeak = rv[i];
-        rpeakIndex = i;
+    for (i = 0; i < procs.n; i++) {
+      var si = indexOf.get(procs.epoch[i]);
+      if (si === undefined) {
+        rowSample[i] = -1;
+        rowKey[i] = -1;
+        continue;
+      }
+      if (si !== curSample) {
+        if (curSample >= 0) flush();
+        curSample = si;
+      }
+      var id = procs.idIdx[i];
+      var kid = idKey[id];
+      if (kid < 0) {
+        var idRec = procs.ids[id];
+        var label = groupBy === "comm" ? idRec.comm : idRec.comm + " " + idRec.pid;
+        var mapKey = groupBy === "comm" ? "c:" + idRec.comm : "p:" + id;
+        if (keyIndex.has(mapKey)) {
+          kid = keyIndex.get(mapKey);
+        } else {
+          kid = keyIds.length;
+          keyIndex.set(mapKey, kid);
+          keyIds.push(mapKey);
+          stats.set(mapKey, {
+            kid: kid, label: label, bestId: id, bestRss: -1,
+            peak: 0, peakIndex: 0, total: 0, seen: 0, maxConcurrent: 0,
+          });
+        }
+        idKey[id] = kid;
+      }
+      var key = keyIds[kid];
+      rowKey[i] = kid;
+      rowSample[i] = si;
+      var val = procs.rss[i];
+      bucket.set(key, (bucket.get(key) || 0) + val);
+      bucketN.set(key, (bucketN.get(key) || 0) + 1);
+      var st2 = stats.get(key);
+      if (val > st2.bestRss) {
+        st2.bestRss = val;
+        st2.bestId = id;
       }
     }
-    series.push({
-      key: "__rest__",
-      label: rest.length + " smaller processes",
-      detail: "everything below the top band, summed",
-      color: "#5b6f7d",
-      values: rv,
-      peak: rpeak,
-      peakIndex: rpeakIndex,
-      mean: rseen ? rtotal / rseen : 0,
-      seen: rseen,
-      maxConcurrent: 0,
-      synthetic: true,
-    });
+    if (curSample >= 0) flush();
+    var keyList = keyIds;
   }
 
-  if (procs.length) {
-    // whatever the sampler didn't log: kernel, page cache, small procs
-    var uv = new Float64Array(n);
-    var upeak = 0, upeakIndex = 0, utotal = 0;
-    for (var j = 0; j < n; j++) {
-      var logged = 0;
-      for (var k = 0; k < series.length; k++) logged += series[k].values[j];
-      uv[j] = Math.max(0, samples[j].used - logged);
-      utotal += uv[j];
-      if (uv[j] > upeak) {
-        upeak = uv[j];
-        upeakIndex = j;
-      }
-    }
-    series.push({
-      key: "__unsampled__",
-      label: "not sampled",
-      detail: "kernel, cache and processes under the size floor",
-      color: "#33454f",
-      values: uv,
-      peak: upeak,
-      peakIndex: upeakIndex,
-      mean: n ? utotal / n : 0,
-      seen: n,
-      maxConcurrent: 0,
-      synthetic: true,
+  var series = [];
+  var hiddenCount = 0;
+  var groupCount = stats.size;
+
+  if (procs.n) {
+    var ranked = Array.from(stats.values()).sort(function (a, b) {
+      return b.peak - a.peak;
     });
+    var shown = ranked.slice(0, topN);
+    hiddenCount = ranked.length - shown.length;
+
+    // --- pass two: dense arrays for the drawn bands only
+    var slot = new Int32Array(keyList.length).fill(-1);
+    shown.forEach(function (st, idx) {
+      slot[st.kid] = idx;
+    });
+    var arrays = shown.map(function () {
+      return new Float64Array(n);
+    });
+    var restArr = hiddenCount ? new Float64Array(n) : null;
+
+    for (i = 0; i < procs.n; i++) {
+      var s2 = rowSample[i];
+      if (s2 < 0) continue;
+      var sl = slot[rowKey[i]];
+      if (sl >= 0) arrays[sl][s2] += procs.rss[i];
+      else if (restArr) restArr[s2] += procs.rss[i];
+    }
+
+    shown.forEach(function (st, idx) {
+      var idRec = procs.ids[st.bestId];
+      series.push({
+        key: "k" + st.kid,
+        label: st.label,
+        detail: describe(idRec.cmdline, idRec.comm),
+        color: PALETTE[idx % PALETTE.length],
+        values: arrays[idx],
+        peak: st.peak,
+        peakIndex: st.peakIndex,
+        mean: st.seen ? st.total / st.seen : 0,
+        seen: st.seen,
+        maxConcurrent: st.maxConcurrent,
+        synthetic: false,
+      });
+    });
+
+    if (restArr) {
+      series.push(
+        mkSeries("__rest__", hiddenCount + " smaller processes",
+          "everything below the drawn bands, summed", "#5b6f7d", restArr, true)
+      );
+    }
+  }
+
+  // --- memory that belongs to no process, straight from /proc/meminfo
+  var hasKernel = samples.some(function (s) {
+    return s.kernel > 0;
+  });
+  var logged = new Float64Array(n);
+  for (i = 0; i < n; i++) {
+    for (k = 0; k < series.length; k++) logged[i] += series[k].values[i];
+  }
+
+  var overshoot = 0;
+  if (procs.n && hasKernel) {
+    var shm = new Float64Array(n), slb = new Float64Array(n), pgt = new Float64Array(n);
+    for (i = 0; i < n; i++) {
+      shm[i] = samples[i].shmem;
+      slb[i] = samples[i].slab;
+      pgt[i] = samples[i].pagetables + samples[i].kstack;
+    }
+    if (d3.max(shm)) {
+      series.push(mkSeries("__shmem__", "tmpfs / shared memory",
+        "Shmem: tmpfs files and shared segments, owned by no process", "#4a5b47", shm, true));
+    }
+    if (d3.max(slb)) {
+      series.push(mkSeries("__slab__", "kernel slab",
+        "dentry and inode caches — millions of build files live here", "#42505f", slb, true));
+    }
+    if (d3.max(pgt)) {
+      series.push(mkSeries("__pgt__", "page tables + kernel stacks",
+        "PageTables + KernelStack", "#4d4657", pgt, true));
+    }
+  }
+
+  var known = new Float64Array(n);
+  for (i = 0; i < n; i++) {
+    for (k = 0; k < series.length; k++) known[i] += series[k].values[i];
+  }
+
+  if (procs.n) {
+    var unacc = new Float64Array(n);
+    for (i = 0; i < n; i++) {
+      var gap = samples[i].used - known[i];
+      if (gap > 0) unacc[i] = gap;
+      else if (-gap > overshoot) overshoot = -gap;
+    }
+    if (d3.max(unacc) > 0) {
+      series.push(mkSeries("__unaccounted__", "unaccounted",
+        "in use per the kernel, but claimed by nothing above", "#33454f", unacc, true));
+    }
   } else {
     // no procs.csv: show total usage so the chart still reads
     var tv = new Float64Array(n);
-    var tpeak = 0, tpeakIndex = 0;
-    for (var q = 0; q < n; q++) {
-      tv[q] = samples[q].used;
-      if (tv[q] > tpeak) {
-        tpeak = tv[q];
-        tpeakIndex = q;
-      }
-    }
-    series.push({
-      key: "__used__",
-      label: "in use",
-      detail: "load procs.csv to break this down by process",
-      color: "#4a6270",
-      values: tv,
-      peak: tpeak,
-      peakIndex: tpeakIndex,
-      mean: tpeak,
-      seen: n,
-      maxConcurrent: 0,
-      synthetic: true,
-    });
+    for (i = 0; i < n; i++) tv[i] = samples[i].used;
+    series.push(mkSeries("__used__", "in use",
+      "load procs.csv to break this down by process", "#4a6270", tv, true));
   }
 
   var memTotal = n ? samples[0].memTotal : 0;
@@ -253,17 +404,27 @@ function buildModel(samples, procs, groupBy, topN) {
   var peakUsed = samples.reduce(function (m, s) {
     return Math.max(m, s.used);
   }, 0);
+  var peakStack = 0;
+  for (i = 0; i < n; i++) {
+    var t = 0;
+    for (k = 0; k < series.length; k++) t += series[k].values[i];
+    if (t > peakStack) peakStack = t;
+  }
 
   return {
     samples: samples,
     series: series,
+    logged: logged,
     memTotal: memTotal,
     cgroupMax: cgroupMax > 0 && cgroupMax < memTotal * 4 ? cgroupMax : 0,
-    yMax: Math.max(memTotal, peakUsed) * 1.02 || 1,
+    yMax: Math.max(memTotal, peakUsed, peakStack) * 1.02 || 1,
     worstIndex: worstIndex,
-    hasProcs: procs.length > 0,
-    groupCount: accs.size,
-    hiddenCount: rest.length,
+    hasProcs: procs.n > 0,
+    hasKernel: hasKernel,
+    groupCount: groupCount,
+    hiddenCount: hiddenCount,
+    overshoot: overshoot,
+    metric: n ? samples[0].metric : "rss",
   };
 }
 
@@ -284,10 +445,10 @@ function fmtClock(d) {
 }
 
 /* ==================================================================
-   chart — focus plot + brushable navigator strip
-   ================================================================== */
+    chart — focus plot + brushable navigator strip
+    ================================================================== */
 
-var M = { top: 16, right: 74, bottom: 22, left: 56 };
+var M = { top: 16, right: 80, bottom: 22, left: 56 };
 var NM = { top: 12, right: 74, bottom: 16, left: 56 };
 
 function gbLabel(kb) {
@@ -301,6 +462,9 @@ function Chart(plot, navEl, onScrub, onPick) {
   this.onPick = onPick;
   this.svg = d3.select(plot).append("svg");
   this.navSvg = d3.select(navEl).append("svg");
+  this.tip = d3.select(plot).append("div").attr("class", "tip").style("display", "none");
+  this.hover = false;
+  this.pointerY = 0;
   this.model = null;
   this.rows = [];
   this.range = [0, 0];
@@ -392,6 +556,7 @@ Chart.prototype.draw = function () {
     root.append("g").attr("class", "g-grid");
     root.append("g").attr("class", "g-layers");
     root.append("g").attr("class", "g-limits");
+    root.append("path").attr("class", "usedline");
     root.append("g").attr("class", "axis y-axis");
     root.append("g").attr("class", "axis x-axis");
     root.append("g").attr("class", "g-cursor");
@@ -488,6 +653,16 @@ Chart.prototype.draw = function () {
       self.onPick(self.picked);
     });
 
+  var usedLine = d3
+    .line()
+    .x(function (d) {
+      return x(d.time);
+    })
+    .y(function (d) {
+      return y(d.used);
+    });
+  root.select("path.usedline").attr("d", usedLine(m.samples) || "");
+
   // hard ceilings: what the kernel has, and what the cgroup will allow
   var limits = [];
   if (m.memTotal) limits.push({ v: m.memTotal, t: "MemTotal" });
@@ -541,13 +716,16 @@ Chart.prototype.draw = function () {
     .attr("width", Math.max(0, W - M.left - M.right))
     .attr("height", Math.max(0, H - M.top - M.bottom))
     .on("pointermove", function (e) {
-      var px = d3.pointer(e)[0];
-      var abs = Math.floor(i0) + d3.bisectCenter(times, x.invert(px));
+      var pt = d3.pointer(e);
+      var abs = Math.floor(i0) + d3.bisectCenter(times, x.invert(pt[0]));
+      self.hover = true;
+      self.pointerY = pt[1];
       self.cursor = abs;
       self.drawCursor();
       self.onScrub(abs);
     })
     .on("pointerleave", function () {
+      self.hover = false;
       self.cursor = m.worstIndex;
       self.drawCursor();
       self.onScrub(null);
@@ -592,6 +770,7 @@ Chart.prototype.drawCursor = function () {
 
   if (i === null || i < 0 || i >= m.samples.length) {
     g.selectAll("line.cursorline,circle.cursordot").attr("display", "none");
+    this.tip.style("display", "none");
     return;
   }
   var cx = x(m.samples[i].time);
@@ -628,7 +807,67 @@ Chart.prototype.drawCursor = function () {
     .attr("cy", function (d) {
       return y(d.v[1]);
     });
+
+  this.drawTip(i, cx);
 };
+
+/* Tooltip: the total the machine is holding at the cursor, plus the one
+    band the pointer is actually inside. The table carries the full
+    breakdown, so this stays to three lines. */
+Chart.prototype.drawTip = function (i, cx) {
+  var m = this.model;
+  var y = this.yScale;
+  if (!m || !y || !this.hover) {
+    this.tip.style("display", "none");
+    return;
+  }
+
+  var s = m.samples[i];
+  var W = this.plot.clientWidth;
+  var H = this.plot.clientHeight;
+
+  // which layer is under the pointer, in stacked (cumulative) space
+  var v = y.invert(this.pointerY);
+  var band = null;
+  for (var k = 0; k < m.series.length; k++) {
+    var seg = this.stacked[k] && this.stacked[k][i];
+    if (seg && v >= seg[0] && v < seg[1] && seg[1] - seg[0] > 0) {
+      band = m.series[k];
+      break;
+    }
+  }
+
+  var html =
+    '<span class="tip__t">' + fmtClock(s.time) + "</span>" +
+    '<div class="tip__row"><span class="tip__k">in use</span>' +
+    '<span class="tip__v">' + fmtKB(s.used) + "</span></div>" +
+    '<div class="tip__row"><span class="tip__k">available</span>' +
+    '<span class="tip__v' + (s.low ? " is-low" : "") + '">' + fmtKB(s.memAvail) + "</span></div>";
+
+  if (band) {
+    html +=
+      '<div class="tip__band"><span class="tip__sw" style="background:' + band.color + '"></span>' +
+      '<span class="tip__name">' + escapeHtml(band.label) + "</span>" +
+      '<span class="tip__bv">' + fmtKB(band.values[i]) + "</span></div>";
+  }
+
+  this.tip.style("display", null).html(html);
+
+  var node = this.tip.node();
+  var tw = node.offsetWidth || 170;
+  var th = node.offsetHeight || 64;
+  var left = cx + 14;
+  if (left + tw > W - 4) left = cx - 14 - tw; // flip before running off the right
+  if (left < 2) left = 2;
+  var top = Math.min(Math.max(this.pointerY - th - 12, M.top), H - M.bottom - th);
+  this.tip.style("left", left + "px").style("top", Math.max(2, top) + "px");
+};
+
+function escapeHtml(t) {
+  return String(t).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
 
 Chart.prototype.drawNav = function () {
   var self = this;
@@ -720,8 +959,8 @@ Chart.prototype.drawNav = function () {
 };
 
 /* ==================================================================
-   table — sortable process list bound to the chart cursor
-   ================================================================== */
+    table — sortable process list bound to the chart cursor
+    ================================================================== */
 
 function Table(tbody, thead, onPick, onHover) {
   var self = this;
@@ -884,8 +1123,8 @@ Table.prototype.updateValues = function () {
 };
 
 /* ==================================================================
-   app — loading, grouping, readout, cross-linking
-   ================================================================== */
+    app — loading, grouping, readout, cross-linking
+    ================================================================== */
 
 function $(id) {
   var el = document.getElementById(id);
@@ -894,8 +1133,9 @@ function $(id) {
 }
 
 var samples = [];
-var procs = [];
+var procs = emptyProcs();
 var groupBy = "comm";
+var bandCount = 12;
 var model = null;
 var currentPick = null;
 
@@ -929,7 +1169,7 @@ var table = new Table(
 
 function rebuild() {
   if (!samples.length) return;
-  model = buildModel(samples, procs, groupBy);
+  model = buildModel(samples, procs, groupBy, bandCount);
   chart.setModel(model);
   table.setModel(model);
   paintReadout(model.worstIndex, true);
@@ -943,12 +1183,24 @@ function rebuild() {
 
   $("table-count").textContent = model.hasProcs
     ? model.groupCount + " " + (groupBy === "comm" ? "names" : "processes") +
-    (model.hiddenCount ? ", " + model.hiddenCount + " folded into one band" : "")
+    (model.hiddenCount ? ", " + model.hiddenCount + " folded into one band" : "") +
+    (model.metric === "pss" ? " · PSS" : "")
     : "load procs.csv for the breakdown";
 
-  $("chart-note").textContent = model.hasProcs
-    ? "Move across the plot to read any moment. Click a band to isolate it."
-    : "Showing total usage only — add procs.csv to break it down.";
+  var note;
+  if (!model.hasProcs) {
+    note = "Showing total usage only — add procs.csv to break it down.";
+  } else if (model.overshoot > 1024) {
+    // sum of RSS above what the kernel reports in use: shared pages are
+    // counted once per process, so the stack can exceed reality
+    note = "Process totals overshoot by up to " + fmtKB(model.overshoot) +
+      " — shared pages count once per process. Re-run the sampler with -P for PSS.";
+  } else if (!model.hasKernel) {
+    note = "Click a band to isolate it. This run predates kernel accounting — re-record for the shmem/slab breakdown.";
+  } else {
+    note = "Move across the plot to read any moment. Click a band to isolate it.";
+  }
+  $("chart-note").textContent = note;
 
   $("empty").classList.add("is-hidden");
 }
@@ -1040,6 +1292,12 @@ app.addEventListener("drop", function (e) {
     return a.name.indexOf("system") >= 0 ? -1 : b.name.indexOf("system") >= 0 ? 1 : 0;
   });
   files.forEach(readFile);
+});
+
+$("band-count").addEventListener("change", function (e) {
+  bandCount = +e.target.value;
+  currentPick = null;
+  rebuild();
 });
 
 document.querySelectorAll(".grouping button").forEach(function (b) {
