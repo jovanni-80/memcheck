@@ -31,9 +31,10 @@
 #   OUTDIR/system.csv  per sample: totals, available, swap, cgroup, load, and
 #                      the kernel-side breakdown (shmem/tmpfs, slab, page
 #                      tables) that explains memory belonging to no process
-#   OUTDIR/procs.csv   per sample, one row per process. comm/ppid/cmdline are
-#                      written only the first time a pid is seen; later rows
-#                      leave them empty. Fill them forward when reading.
+#   OUTDIR/procs.csv   per sample, one row per process, tagged with the build
+#                      step it belongs to (compile/link/archive/...).
+#                      comm/ppid/role/cmdline are written only the first time a
+#                      pid is seen; later rows leave them empty. Fill forward.
 #   OUTDIR/meta.txt    host/kernel/limits/tmpfs captured at start
 #
 set -uo pipefail
@@ -104,7 +105,7 @@ report() {
         echo "=== 25 largest processes at that moment ==="
         printf '%8s %10s %10s  %s\n' PID RSS_MB VSZ_MB COMMAND
         awk -F, -v e="$worst" '
-            NR>1 && $5 != "" { name[$2] = $5; cmd[$2] = $7 }
+            NR>1 && $5 != "" { name[$2] = $5; cmd[$2] = $8 }
             NR>1 && $1 == e  { printf "%8s %10.1f %10.1f  %s %.90s\n", $2, $3/1024, $4/1024, name[$2], cmd[$2] }
         ' "$dir/procs.csv" | sort -k2 -nr | head -25
 
@@ -119,6 +120,56 @@ report() {
                     if (cnt[k] > maxn[a[2]]) maxn[a[2]] = cnt[k] }
                   for (nm in peak) printf "%10.1f %6d  %s\n", peak[nm]/1024, maxn[nm], nm }
         ' "$dir/procs.csv" | sort -k1 -nr | head -25
+        echo
+        echo "=== memory per build step ==="
+        echo "Peak RSS reached by each individual process, grouped by what it was doing."
+        echo "Size job pools off p95, not the mean — the mean hides the file that kills you."
+        printf '%-10s %7s %9s %9s %9s %9s\n' STEP PROCS MEAN_MB P50_MB P95_MB MAX_MB
+        awk -F, '
+            NR>1 {
+                pid = $2
+                if ($5 != "") { gen[pid]++; role[pid] = ($7 == "" ? "other" : $7) }
+                key = pid ":" gen[pid]
+                if ($3 + 0 > peak[key]) peak[key] = $3 + 0
+                who[key] = role[pid]
+            }
+            END { for (k in peak) print who[k], peak[k] }
+        ' "$dir/procs.csv" | sort -k1,1 -k2,2n | awk '
+            { v[$1, ++c[$1]] = $2 + 0; s[$1] += $2 }
+            END {
+                for (r in c) {
+                    n = c[r]
+                    p50 = v[r, int((n + 1) / 2)]
+                    p95 = v[r, int(n * 0.95) < 1 ? 1 : int(n * 0.95)]
+                    printf "%-10s %7d %9.1f %9.1f %9.1f %9.1f\n",
+                        r, n, s[r] / n / 1024, p50 / 1024, p95 / 1024, v[r, n] / 1024
+                }
+            }' | sort -k5 -nr
+
+        echo
+        echo "=== how much of the machine each step held at once ==="
+        printf '%-10s %13s %13s %9s %9s\n' STEP MEAN_TOTAL_GB PEAK_TOTAL_GB MEAN_N PEAK_N
+        awk -F, '
+            NR>1 {
+                pid = $2
+                if ($5 != "") role[pid] = ($7 == "" ? "other" : $7)
+                r = role[pid]
+                sum[$1, r] += $3; cnt[$1, r]++
+                seen[$1] = 1; roles[r] = 1
+            }
+            END {
+                for (e in seen) samples++
+                for (k in sum) {
+                    split(k, a, SUBSEP); r = a[2]
+                    tot[r] += sum[k]; num[r] += cnt[k]
+                    if (sum[k] > pt[r]) pt[r] = sum[k]
+                    if (cnt[k] > pn[r]) pn[r] = cnt[k]
+                }
+                for (r in roles)
+                    printf "%-10s %13.2f %13.2f %9.1f %9d\n",
+                        r, tot[r] / samples / 1048576, pt[r] / 1048576,
+                        num[r] / samples, pn[r]
+            }' "$dir/procs.csv" | sort -k3 -nr
     fi
 }
 
@@ -131,7 +182,7 @@ fi
 
 if [[ -z $OUTDIR ]]; then
     printf -v _stamp '%(%Y%m%d-%H%M%S)T' -1
-    OUTDIR="./memwatch-$_stamp"
+    OUTDIR="/tmp/memwatch-$_stamp"
 fi
 mkdir -p "$OUTDIR" || exit 1
 
@@ -176,7 +227,7 @@ fi
 exec 3>>"$OUTDIR/system.csv"
 exec 4>>"$OUTDIR/procs.csv"
 [[ -s $OUTDIR/system.csv ]] || printf 'iso,epoch,mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,swap_total_kb,swap_free_kb,committed_kb,cgroup_cur_kb,cgroup_max_kb,load1,procs_running,low,shmem_kb,slab_kb,sreclaimable_kb,sunreclaim_kb,pagetables_kb,kernelstack_kb,anon_kb,mapped_kb,hugetlb_kb,procs_logged,metric\n' >&3
-[[ -s $OUTDIR/procs.csv ]]  || printf 'epoch,pid,rss_kb,vsz_kb,comm,ppid,cmdline\n' >&4
+[[ -s $OUTDIR/procs.csv ]]  || printf 'epoch,pid,rss_kb,vsz_kb,comm,ppid,role,cmdline\n' >&4
 
 # fork-free sleep: block on an empty fifo with a read timeout
 HAVE_FIFO=0
@@ -191,6 +242,7 @@ HAVE_MAPFILE_D=0
 (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) && HAVE_MAPFILE_D=1
 
 declare -A SEEN   # pid -> comm, so a pid's identity is written just once
+declare -A ROLE   # pid -> compile/link/archive/..., inherited by children
 
 MIN_AVAIL=999999999
 MIN_AVAIL_AT=""
@@ -220,6 +272,69 @@ get_ppid() {
     PPID_OUT=${2:-0}
 }
 
+# Work out what build step a process belongs to.
+#
+# `comm` is capped at 15 characters by the kernel, so a toolchain-prefixed
+# binary like x86_64-linux-gnu-g++-13 arrives truncated and unrecognisable.
+# argv[0] is not truncated, so match on that first. A gcc/g++ driver is a
+# compile or a link depending only on its arguments, and the helpers it forks
+# (cc1plus, collect2, ld, lto1) inherit the answer through their parent.
+classify() {
+    local comm=$1 cmd=$2 ppid=$3 prog spaced
+    prog=${cmd%% *}
+    prog=${prog##*/}
+
+    case $prog in
+        cc1plus|cc1|cc1obj|cc1objplus|f951) ROLE_OUT=compile; return ;;
+        lto1|lto-wrapper)                   ROLE_OUT=link;    return ;;
+        collect2|ld|ld.bfd|ld.gold|ld.lld|lld|gold|mold|wild) ROLE_OUT=link; return ;;
+        ar|ranlib|llvm-ar|llvm-ranlib)      ROLE_OUT=archive; return ;;
+        as|gas|llvm-as)                     ROLE_OUT=assemble; return ;;
+        strip|objcopy|dsymutil)             ROLE_OUT=postlink; return ;;
+    esac
+    case $comm in
+        cc1plus|cc1|lto1) ROLE_OUT=compile; [[ $comm == lto1 ]] && ROLE_OUT=link; return ;;
+        collect2|ld|ld.bfd|ld.gold|ld.lld|lld|mold) ROLE_OUT=link; return ;;
+    esac
+
+    # a driver: the arguments decide. pad so " -c " matches at either end.
+    case $prog in
+        *gcc*|*g++*|*clang*|*c++|cc|ccache|distcc|sccache|*-ld|ld*)
+            spaced=" $cmd "
+            case $spaced in
+                *" -c "*|*" -S "*|*" -fsyntax-only "*) ROLE_OUT=compile; return ;;
+                *" -E "*)                              ROLE_OUT=preprocess; return ;;
+                *" -shared "*|*" -Wl,"*|*" -o "*.so*|*" -o "*.a\ *|*.o\ *)
+                                                       ROLE_OUT=link; return ;;
+            esac
+            ;;
+    esac
+
+    # a wrapper or interpreter may sit in front of the real tool: ccache,
+    # distcc, or a shell/python wrapper script. Look a few arguments in.
+    set -f
+    local tok i=0
+    for tok in $cmd; do
+        (( i++ > 4 )) && break
+        tok=${tok##*/}
+        case $tok in
+            cc1plus|cc1|cc1obj|cc1objplus|f951) set +f; ROLE_OUT=compile; return ;;
+            lto1)                               set +f; ROLE_OUT=link;    return ;;
+            collect2|ld|ld.bfd|ld.gold|ld.lld|lld|mold|gold) set +f; ROLE_OUT=link; return ;;
+            ar|ranlib|llvm-ar)                  set +f; ROLE_OUT=archive; return ;;
+            as|gas)                             set +f; ROLE_OUT=assemble; return ;;
+        esac
+    done
+    set +f
+
+    # otherwise take the parent's step, so wrappers and shells don't orphan
+    # their children into "other"
+    case ${ROLE[$ppid]:-} in
+        compile|link|archive|assemble|postlink) ROLE_OUT=${ROLE[$ppid]}; return ;;
+    esac
+    ROLE_OUT=other
+}
+
 # Append one process row to $batch. comm/ppid/cmdline are written only when the
 # pid is new (or has been recycled onto a different program), which is most of
 # the row width — without it, logging every process triples the log size.
@@ -242,7 +357,7 @@ emit_row() {
     comm=${comm//,/_}
 
     if [[ ${SEEN[$pid]:-} == "$comm" ]]; then
-        printf -v line '%s,%s,%s,%s,,,\n' "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))"
+        printf -v line '%s,%s,%s,%s,,,,\n' "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))"
     else
         SEEN[$pid]=$comm
         cmd=""
@@ -254,10 +369,12 @@ emit_row() {
         cmd=${cmd//$'\n'/ }
         cmd=${cmd//$'\t'/ }
         cmd=${cmd//\"/\'}
-        (( ${#cmd} > 300 )) && cmd="${cmd:0:300}..."
+        (( ${#cmd} > 2048 )) && cmd="${cmd:0:2048}..."
         get_ppid "$pid"
-        printf -v line '%s,%s,%s,%s,%s,%s,"%s"\n' \
-            "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))" "$comm" "$PPID_OUT" "$cmd"
+        classify "$comm" "$cmd" "$PPID_OUT"
+        ROLE[$pid]=$ROLE_OUT
+        printf -v line '%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+            "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))" "$comm" "$PPID_OUT" "$ROLE_OUT" "$cmd"
     fi
 
     batch+=$line
@@ -323,7 +440,7 @@ while (( RUNNING )); do
     fi
 
     for statm in /proc/[0-9]*/statm; do
-        [ -r "$statm" ] || continue
+        [-r "$statm" ] || continue
         read -r vsz rss _ < "$statm" 2>/dev/null || continue
         (( rss > 0 && rss >= MIN_RSS_PAGES )) || continue
         pid=${statm#/proc/}; pid=${pid%/statm}

@@ -13,6 +13,27 @@ var PALETTE = [
   "#c9b06e", "#7f9fe0", "#a0d8c0", "#d9a0d0", "#c2c96e", "#8ec4e8",
 ];
 
+/* Build steps, as tagged by the sampler. Fixed colours: compile and link
+    should look the same in every run rather than shifting with rank. */
+var ROLE_LABEL = {
+  compile: "compile",
+  link: "link",
+  assemble: "assemble",
+  archive: "archive",
+  preprocess: "preprocess",
+  postlink: "post-link",
+  other: "everything else",
+};
+var ROLE_COLOR = {
+  compile: "#4fc3b0",
+  link: "#e8a33d",
+  assemble: "#7ea6f0",
+  archive: "#c98be0",
+  preprocess: "#86c765",
+  postlink: "#dcc45e",
+  other: "#5b6f7d",
+};
+
 function num(v) {
   var n = Number(v);
   return isFinite(n) ? n : 0;
@@ -100,7 +121,8 @@ function parseProcs(text) {
     col[h] = i;
   });
   var iEpoch = col.epoch, iPid = col.pid, iRss = col.rss_kb,
-    iVsz = col.vsz_kb, iComm = col.comm, iPpid = col.ppid, iCmd = col.cmdline;
+    iVsz = col.vsz_kb, iComm = col.comm, iPpid = col.ppid,
+    iCmd = col.cmdline, iRole = col.role;
   if (iEpoch === undefined || iPid === undefined || iRss === undefined) {
     return emptyProcs();
   }
@@ -139,12 +161,13 @@ function parseProcs(text) {
         comm: comm,
         ppid: iPpid === undefined ? 0 : +row[iPpid] || 0,
         cmdline: iCmd === undefined ? "" : row[iCmd] || "",
+        role: iRole === undefined ? "" : row[iRole] || "other",
       });
       live.set(pid, idx);
     } else if (idx < 0) {
       // compact row for a pid whose identity row we never saw
       idx = ids.length;
-      ids.push({ pid: pid, comm: "pid " + pid, ppid: 0, cmdline: "" });
+      ids.push({ pid: pid, comm: "pid " + pid, ppid: 0, cmdline: "", role: "other" });
       live.set(pid, idx);
     }
 
@@ -251,8 +274,17 @@ function buildModel(samples, procs, groupBy, topN) {
       var kid = idKey[id];
       if (kid < 0) {
         var idRec = procs.ids[id];
-        var label = groupBy === "comm" ? idRec.comm : idRec.comm + " " + idRec.pid;
-        var mapKey = groupBy === "comm" ? "c:" + idRec.comm : "p:" + id;
+        var label, mapKey;
+        if (groupBy === "role") {
+          label = ROLE_LABEL[idRec.role] || idRec.role || "other";
+          mapKey = "r:" + (idRec.role || "other");
+        } else if (groupBy === "comm") {
+          label = idRec.comm;
+          mapKey = "c:" + idRec.comm;
+        } else {
+          label = idRec.comm + " " + idRec.pid;
+          mapKey = "p:" + id;
+        }
         if (keyIndex.has(mapKey)) {
           kid = keyIndex.get(mapKey);
         } else {
@@ -316,8 +348,14 @@ function buildModel(samples, procs, groupBy, topN) {
       series.push({
         key: "k" + st.kid,
         label: st.label,
-        detail: describe(idRec.cmdline, idRec.comm),
-        color: PALETTE[idx % PALETTE.length],
+        detail:
+          groupBy === "role"
+            ? st.seen + " samples, " + st.maxConcurrent + " at once at the busiest"
+            : describe(idRec.cmdline, idRec.comm),
+        color:
+          groupBy === "role"
+            ? ROLE_COLOR[st.label] || ROLE_COLOR[idRec.role] || PALETTE[idx % PALETTE.length]
+            : PALETTE[idx % PALETTE.length],
         values: arrays[idx],
         peak: st.peak,
         peakIndex: st.peakIndex,
@@ -1182,7 +1220,8 @@ function rebuild() {
     " · " + mins + " min · " + fmtKB(model.memTotal) + " RAM";
 
   $("table-count").textContent = model.hasProcs
-    ? model.groupCount + " " + (groupBy === "comm" ? "names" : "processes") +
+    ? model.groupCount + " " +
+    (groupBy === "comm" ? "names" : groupBy === "role" ? "build steps" : "processes") +
     (model.hiddenCount ? ", " + model.hiddenCount + " folded into one band" : "") +
     (model.metric === "pss" ? " · PSS" : "")
     : "load procs.csv for the breakdown";
