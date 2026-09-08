@@ -13,27 +13,6 @@ var PALETTE = [
   "#c9b06e", "#7f9fe0", "#a0d8c0", "#d9a0d0", "#c2c96e", "#8ec4e8",
 ];
 
-/* Build steps, as tagged by the sampler. Fixed colours: compile and link
-    should look the same in every run rather than shifting with rank. */
-var ROLE_LABEL = {
-  compile: "compile",
-  link: "link",
-  assemble: "assemble",
-  archive: "archive",
-  preprocess: "preprocess",
-  postlink: "post-link",
-  other: "everything else",
-};
-var ROLE_COLOR = {
-  compile: "#4fc3b0",
-  link: "#e8a33d",
-  assemble: "#7ea6f0",
-  archive: "#c98be0",
-  preprocess: "#86c765",
-  postlink: "#dcc45e",
-  other: "#5b6f7d",
-};
-
 function num(v) {
   var n = Number(v);
   return isFinite(n) ? n : 0;
@@ -83,7 +62,17 @@ function parseSystem(text) {
       hugetlb: num(r.hugetlb_kb),
       procsLogged: num(r.procs_logged),
       metric: r.metric || "rss",
-      kernel: shmem + slab + pagetables + kstack,
+      availAfter: num(r.mem_avail_after_kb),
+      scanMs: num(r.scan_ms),
+      exitsN: num(r.exits_n),
+      exitsKb: num(r.exits_kb),
+      startsN: num(r.starts_n),
+      dirty: num(r.dirty_kb),
+      writeback: num(r.writeback_kb),
+      kernel: shmem + slab + pagetables + kstack + num(r.dirty_kb) + num(r.writeback_kb),
+      // how far MemAvailable moved between the readings taken either side
+      // of the process walk: memory that changed hands mid-scan
+      drift: Math.abs(num(r.mem_avail_after_kb) - memAvail),
       used: Math.max(0, memTotal - memAvail),
       swapUsed: Math.max(0, swapTotal - swapFree),
     });
@@ -121,8 +110,8 @@ function parseProcs(text) {
     col[h] = i;
   });
   var iEpoch = col.epoch, iPid = col.pid, iRss = col.rss_kb,
-    iVsz = col.vsz_kb, iComm = col.comm, iPpid = col.ppid,
-    iCmd = col.cmdline, iRole = col.role;
+      iVsz = col.vsz_kb, iComm = col.comm, iPpid = col.ppid,
+      iCmd = col.cmdline;
   if (iEpoch === undefined || iPid === undefined || iRss === undefined) {
     return emptyProcs();
   }
@@ -161,13 +150,12 @@ function parseProcs(text) {
         comm: comm,
         ppid: iPpid === undefined ? 0 : +row[iPpid] || 0,
         cmdline: iCmd === undefined ? "" : row[iCmd] || "",
-        role: iRole === undefined ? "" : row[iRole] || "other",
-      });
+        });
       live.set(pid, idx);
     } else if (idx < 0) {
       // compact row for a pid whose identity row we never saw
       idx = ids.length;
-      ids.push({ pid: pid, comm: "pid " + pid, ppid: 0, cmdline: "", role: "other" });
+      ids.push({ pid: pid, comm: "pid " + pid, ppid: 0, cmdline: "" });
       live.set(pid, idx);
     }
 
@@ -181,6 +169,38 @@ function parseProcs(text) {
   });
 
   return { n: n, epoch: epoch, idIdx: idIdx, rss: rss, vsz: vsz, ids: ids };
+}
+
+/** exits.csv → processes that vanished between two ticks, keyed by the
+  *  tick that noticed. These held memory that was counted in the machine
+  *  totals but appears in no process row, which is precisely the shape of
+  *  a gap that grows with build parallelism. */
+function parseExits(text) {
+  var byEpoch = new Map();
+  var total = 0;
+  d3.csvParse(text).forEach(function (r) {
+    var e = num(r.epoch);
+    if (!e) return;
+    var rec = {
+      epoch: e,
+      pid: num(r.pid),
+      ppid: num(r.ppid),
+      comm: r.comm || "?",
+      rss: num(r.last_rss_kb),
+      hwm: num(r.hwm_kb),
+      lifetime: num(r.lifetime_s),
+      cmdline: r.cmdline || "",
+    };
+    if (!byEpoch.has(e)) byEpoch.set(e, []);
+    byEpoch.get(e).push(rec);
+    total++;
+  });
+  byEpoch.forEach(function (list) {
+    list.sort(function (a, b) {
+      return b.rss - a.rss;
+    });
+  });
+  return { byEpoch: byEpoch, total: total };
 }
 
 /* Shorten a cmdline to the bit that identifies the work: the last
@@ -274,17 +294,8 @@ function buildModel(samples, procs, groupBy, topN) {
       var kid = idKey[id];
       if (kid < 0) {
         var idRec = procs.ids[id];
-        var label, mapKey;
-        if (groupBy === "role") {
-          label = ROLE_LABEL[idRec.role] || idRec.role || "other";
-          mapKey = "r:" + (idRec.role || "other");
-        } else if (groupBy === "comm") {
-          label = idRec.comm;
-          mapKey = "c:" + idRec.comm;
-        } else {
-          label = idRec.comm + " " + idRec.pid;
-          mapKey = "p:" + id;
-        }
+        var label = groupBy === "comm" ? idRec.comm : idRec.comm + " " + idRec.pid;
+        var mapKey = groupBy === "comm" ? "c:" + idRec.comm : "p:" + id;
         if (keyIndex.has(mapKey)) {
           kid = keyIndex.get(mapKey);
         } else {
@@ -348,14 +359,8 @@ function buildModel(samples, procs, groupBy, topN) {
       series.push({
         key: "k" + st.kid,
         label: st.label,
-        detail:
-          groupBy === "role"
-            ? st.seen + " samples, " + st.maxConcurrent + " at once at the busiest"
-            : describe(idRec.cmdline, idRec.comm),
-        color:
-          groupBy === "role"
-            ? ROLE_COLOR[st.label] || ROLE_COLOR[idRec.role] || PALETTE[idx % PALETTE.length]
-            : PALETTE[idx % PALETTE.length],
+        detail: describe(idRec.cmdline, idRec.comm),
+        color: PALETTE[idx % PALETTE.length],
         values: arrays[idx],
         peak: st.peak,
         peakIndex: st.peakIndex,
@@ -403,6 +408,18 @@ function buildModel(samples, procs, groupBy, topN) {
       series.push(mkSeries("__pgt__", "page tables + kernel stacks",
         "PageTables + KernelStack", "#4d4657", pgt, true));
     }
+    var dw = new Float64Array(n);
+    for (i = 0; i < n; i++) dw[i] = samples[i].dirty + samples[i].writeback;
+    if (d3.max(dw)) {
+      series.push(mkSeries("__dirty__", "dirty + writeback",
+        "written but not yet flushed — link temporaries land here", "#4a4340", dw, true));
+    }
+  }
+
+  // processes that died mid-walk: counted in the totals, in no row
+  var exitsBand = null;
+  if (procs.n && samples.some(function (s) { return s.exitsKb > 0; })) {
+    exitsBand = new Float64Array(n);
   }
 
   var known = new Float64Array(n);
@@ -414,8 +431,21 @@ function buildModel(samples, procs, groupBy, topN) {
     var unacc = new Float64Array(n);
     for (i = 0; i < n; i++) {
       var gap = samples[i].used - known[i];
-      if (gap > 0) unacc[i] = gap;
-      else if (-gap > overshoot) overshoot = -gap;
+      if (gap > 0) {
+        // attribute as much of the gap as the churn can account for
+        if (exitsBand) {
+          exitsBand[i] = Math.min(gap, samples[i].exitsKb);
+          gap -= exitsBand[i];
+        }
+        unacc[i] = gap;
+      } else if (-gap > overshoot) {
+        overshoot = -gap;
+      }
+    }
+    if (exitsBand && d3.max(exitsBand) > 0) {
+      series.push(mkSeries("__exits__", "exited mid-scan",
+        "processes that vanished while the sampler was walking /proc",
+        "#8a5a3c", exitsBand, true));
     }
     if (d3.max(unacc) > 0) {
       series.push(mkSeries("__unaccounted__", "unaccounted",
@@ -462,6 +492,7 @@ function buildModel(samples, procs, groupBy, topN) {
     groupCount: groupCount,
     hiddenCount: hiddenCount,
     overshoot: overshoot,
+    meanDrift: n ? samples.reduce(function (t, s) { return t + s.drift; }, 0) / n : 0,
     metric: n ? samples[0].metric : "rss",
   };
 }
@@ -882,6 +913,22 @@ Chart.prototype.drawTip = function (i, cx) {
     '<div class="tip__row"><span class="tip__k">available</span>' +
     '<span class="tip__v' + (s.low ? " is-low" : "") + '">' + fmtKB(s.memAvail) + "</span></div>";
 
+  var gone = EXITS_AT(s.epoch);
+  if (gone && gone.length) {
+    var top = gone[0];
+    html +=
+      '<div class="tip__band"><span class="tip__sw" style="background:#8a5a3c"></span>' +
+      '<span class="tip__name">' + escapeHtml(top.comm) + " " + top.pid + " exited</span>" +
+      '<span class="tip__bv">' + fmtKB(top.hwm || top.rss) + "</span></div>";
+    if (gone.length > 1) {
+      html +=
+        '<div class="tip__row"><span class="tip__k">+ ' + (gone.length - 1) +
+        ' more exited</span><span class="tip__v">' +
+        fmtKB(gone.reduce(function (t, g, gi) { return gi ? t + g.rss : t; }, 0)) +
+        "</span></div>";
+    }
+  }
+
   if (band) {
     html +=
       '<div class="tip__band"><span class="tip__sw" style="background:' + band.color + '"></span>' +
@@ -899,6 +946,11 @@ Chart.prototype.drawTip = function (i, cx) {
   if (left < 2) left = 2;
   var top = Math.min(Math.max(this.pointerY - th - 12, M.top), H - M.bottom - th);
   this.tip.style("left", left + "px").style("top", Math.max(2, top) + "px");
+};
+
+/* Set by the app once exits.csv is loaded; the chart asks by epoch. */
+var EXITS_AT = function () {
+  return null;
 };
 
 function escapeHtml(t) {
@@ -1172,6 +1224,7 @@ function $(id) {
 
 var samples = [];
 var procs = emptyProcs();
+var exits = { byEpoch: new Map(), total: 0 };
 var groupBy = "comm";
 var bandCount = 12;
 var model = null;
@@ -1207,6 +1260,9 @@ var table = new Table(
 
 function rebuild() {
   if (!samples.length) return;
+  EXITS_AT = function (epoch) {
+    return exits.byEpoch.get(epoch) || null;
+  };
   model = buildModel(samples, procs, groupBy, bandCount);
   chart.setModel(model);
   table.setModel(model);
@@ -1220,10 +1276,9 @@ function rebuild() {
     " · " + mins + " min · " + fmtKB(model.memTotal) + " RAM";
 
   $("table-count").textContent = model.hasProcs
-    ? model.groupCount + " " +
-    (groupBy === "comm" ? "names" : groupBy === "role" ? "build steps" : "processes") +
-    (model.hiddenCount ? ", " + model.hiddenCount + " folded into one band" : "") +
-    (model.metric === "pss" ? " · PSS" : "")
+    ? model.groupCount + " " + (groupBy === "comm" ? "names" : "processes") +
+      (model.hiddenCount ? ", " + model.hiddenCount + " folded into one band" : "") +
+      (model.metric === "pss" ? " · PSS" : "")
     : "load procs.csv for the breakdown";
 
   var note;
@@ -1234,6 +1289,9 @@ function rebuild() {
     // counted once per process, so the stack can exceed reality
     note = "Process totals overshoot by up to " + fmtKB(model.overshoot) +
       " — shared pages count once per process. Re-run the sampler with -P for PSS.";
+  } else if (model.meanDrift > 262144) {
+    note = "Memory moved by " + fmtKB(model.meanDrift) +
+      " on average while the sampler walked /proc — the gap is partly churn, not a hidden process.";
   } else if (!model.hasKernel) {
     note = "Click a band to isolate it. This run predates kernel accounting — re-record for the shmem/slab breakdown.";
   } else {
@@ -1269,6 +1327,9 @@ function ingest(name, text) {
   if (/mem_total_kb/.test(head)) {
     samples = parseSystem(text);
     markPicker("file-system");
+  } else if (/last_rss_kb/.test(head)) {
+    exits = parseExits(text);
+    markPicker("file-exits");
   } else if (/rss_kb/.test(head)) {
     procs = parseProcs(text);
     markPicker("file-procs");
@@ -1307,7 +1368,7 @@ function readFile(f) {
   r.readAsText(f);
 }
 
-["file-system", "file-procs"].forEach(function (id) {
+["file-system", "file-procs", "file-exits"].forEach(function (id) {
   $(id).addEventListener("change", function (e) {
     var f = e.target.files && e.target.files[0];
     if (f) readFile(f);
@@ -1327,8 +1388,11 @@ app.addEventListener("drop", function (e) {
   app.classList.remove("is-dragging");
   var files = Array.prototype.slice.call((e.dataTransfer && e.dataTransfer.files) || []);
   // system.csv first: procs rows are dropped unless the time axis exists
+  var rank = function (f) {
+    return f.name.indexOf("system") >= 0 ? 0 : f.name.indexOf("exits") >= 0 ? 2 : 1;
+  };
   files.sort(function (a, b) {
-    return a.name.indexOf("system") >= 0 ? -1 : b.name.indexOf("system") >= 0 ? 1 : 0;
+    return rank(a) - rank(b);
   });
   files.forEach(readFile);
 });
@@ -1361,6 +1425,9 @@ Promise.all([
   fetch("procs.csv").then(function (r) {
     return r.ok ? r.text() : null;
   }),
+  fetch("exits.csv").then(function (r) {
+    return r.ok ? r.text() : null;
+  }),
 ])
   .then(function (res) {
     if (!res[0] || !/mem_total_kb/.test(res[0].slice(0, 400))) return;
@@ -1369,6 +1436,10 @@ Promise.all([
     if (res[1] && /rss_kb/.test(res[1].slice(0, 400))) {
       procs = parseProcs(res[1]);
       markPicker("file-procs");
+    }
+    if (res[2] && /last_rss_kb/.test(res[2].slice(0, 400))) {
+      exits = parseExits(res[2]);
+      markPicker("file-exits");
     }
     rebuild();
   })

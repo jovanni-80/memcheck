@@ -20,6 +20,10 @@
 #                 cap. Use this only if the log is growing too fast to keep.
 #   -a PCT        flag a sample "low" when MemAvailable < PCT% of MemTotal,
 #                 default 10
+#   -H MB         read VmHWM/VmSwap for processes at or above this size,
+#                 default 256. VmHWM is the kernel's own high-water mark, so a
+#                 process that peaked between two ticks still reports its true
+#                 maximum. Set 0 to probe everything (slower scan).
 #   -P            record PSS instead of RSS by reading smaps_rollup. Slower
 #                 (the kernel walks page tables per process) but shared pages
 #                 are divided between sharers instead of counted once each, so
@@ -31,10 +35,13 @@
 #   OUTDIR/system.csv  per sample: totals, available, swap, cgroup, load, and
 #                      the kernel-side breakdown (shmem/tmpfs, slab, page
 #                      tables) that explains memory belonging to no process
-#   OUTDIR/procs.csv   per sample, one row per process, tagged with the build
-#                      step it belongs to (compile/link/archive/...).
-#                      comm/ppid/role/cmdline are written only the first time a
+#   OUTDIR/procs.csv   per sample, one row per process.
+#                      comm/ppid/cmdline are written only the first time a
 #                      pid is seen; later rows leave them empty. Fill forward.
+#   OUTDIR/exits.csv   one row per process that vanished between ticks, with
+#                      its last observed RSS and its peak. A process that dies
+#                      partway through a scan is counted in the memory total
+#                      but in no process row; this is where it is named.
 #   OUTDIR/meta.txt    host/kernel/limits/tmpfs captured at start
 #
 set -uo pipefail
@@ -44,6 +51,7 @@ MIN_RSS_KB=0
 CAP=0
 ALERT_PCT=10
 USE_PSS=0
+PROBE_KB=262144
 OUTDIR=""
 PAGE_KB=4
 
@@ -56,9 +64,10 @@ while (($#)); do
         -n) CAP=$2; shift 2 ;;
         -a) ALERT_PCT=$2; shift 2 ;;
         -P) USE_PSS=1; shift ;;
+        -H) PROBE_KB=$(( $2 * 1024 )); shift 2 ;;
         -o) OUTDIR=$2; shift 2 ;;
         --report) MODE=report; REPORT_DIR=${2:-}; shift 2 ;;
-        -h|--help) sed -n '3,37p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,48p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -94,6 +103,60 @@ report() {
         exit
     }' "$dir/system.csv"
 
+    echo
+    echo "=== the unaccounted gap, and what explains it ==="
+    echo "gap = in use  -  sum of process RSS  -  kernel (shmem/slab/pagetables)"
+    awk -F, -v pf="$dir/procs.csv" '
+        NR>1 {
+            used[$2] = $3 - $4
+            kern[$2] = $16 + $17 + $20 + $21 + $32 + $33
+            scan[$2] = $28; exn[$2] = $29; exkb[$2] = $30
+            bracket[$2] = ($4 > $27 ? $4 - $27 : $27 - $4)
+            order[++m] = $2
+        }
+        END {
+            while ((getline line < pf) > 0) {
+                if (++r == 1) continue
+                split(line, f, ",")
+                rss[f[1]] += f[3]
+            }
+            for (i = 1; i <= m; i++) {
+                e = order[i]
+                g = used[e] - rss[e] - kern[e]
+                if (g < 0) g = 0
+                sg += g; if (g > mg) { mg = g; mge = e }
+                sx += exkb[e]; ss += scan[e]; sb += bracket[e]
+                if (exkb[e] > 0 && g > 0) { cov += (exkb[e] < g ? exkb[e] : g) }
+            }
+            printf "  mean gap                        %8.2f GB\n", sg/m/1048576
+            printf "  worst gap                       %8.2f GB   at epoch %s\n", mg/1048576, mge
+            printf "  mean scan duration              %8.0f ms\n", ss/m
+            printf "  mean meminfo drift across scan  %8.2f GB   <- memory that moved mid-walk\n", sb/m/1048576
+            printf "  mean memory of processes that\n"
+            printf "    exited during the tick        %8.2f GB\n", sx/m/1048576
+            printf "  of the gap, explained by exits  %8.2f GB\n", cov/m/1048576
+        }' "$dir/system.csv"
+
+    if [[ -f $dir/exits.csv ]]; then
+        echo
+        echo "=== biggest processes that vanished between ticks ==="
+        echo "These held memory counted in the totals but appear in no process row."
+        printf '%10s %8s %8s %7s  %s\n' LAST_MB PEAK_MB PID PPID COMMAND
+        awk -F, 'NR>1 { cmd = $9; for (i=10; i<=NF; i++) cmd = cmd "," $i
+            gsub(/^"|"$/, "", cmd)
+            printf "%10.1f %8.1f %8s %7s  %s %.70s\n", $5/1024, ($6==""?0:$6)/1024, $2, $3, $4, cmd }' \
+            "$dir/exits.csv" | sort -k1 -nr | head -20
+
+        echo
+        echo "=== short-lived memory hogs, by name ==="
+        printf '%8s %12s %12s %10s  %s\n' COUNT PEAK_SUM_MB MEAN_PEAK_MB MEAN_LIFE_S NAME
+        awk -F, 'NR>1 { p = ($6 == "" ? $5 : $6)
+            n[$4]++; s[$4] += p; life[$4] += $8 }
+            END { for (k in n) printf "%8d %12.1f %12.1f %10.1f  %s\n",
+                n[k], s[k]/1024, s[k]/n[k]/1024, life[k]/n[k], k }' \
+            "$dir/exits.csv" | sort -k2 -nr | head -15
+    fi
+
     if [[ -f $dir/procs.csv ]]; then
         awk -F, -v e="$worst" 'NR>1 && $1==e { s += $3 } END {
             printf "  sum of process RSS  %9.2f GB\n", s/1048576
@@ -105,7 +168,7 @@ report() {
         echo "=== 25 largest processes at that moment ==="
         printf '%8s %10s %10s  %s\n' PID RSS_MB VSZ_MB COMMAND
         awk -F, -v e="$worst" '
-            NR>1 && $5 != "" { name[$2] = $5; cmd[$2] = $8 }
+            NR>1 && $7 != "" { name[$2] = $7; cmd[$2] = $9 }
             NR>1 && $1 == e  { printf "%8s %10.1f %10.1f  %s %.90s\n", $2, $3/1024, $4/1024, name[$2], cmd[$2] }
         ' "$dir/procs.csv" | sort -k2 -nr | head -25
 
@@ -113,63 +176,13 @@ report() {
         echo "=== peak RSS ever seen, per process name ==="
         printf '%10s %6s  %s\n' PEAK_MB MAX_N NAME
         awk -F, '
-            NR>1 && $5 != "" { name[$2] = $5 }
+            NR>1 && $7 != "" { name[$2] = $7 }
             NR>1 { k = $1 SUBSEP name[$2]; sum[k] += $3; cnt[k]++ }
             END { for (k in sum) { split(k, a, SUBSEP)
                     if (sum[k] > peak[a[2]]) peak[a[2]] = sum[k]
                     if (cnt[k] > maxn[a[2]]) maxn[a[2]] = cnt[k] }
                   for (nm in peak) printf "%10.1f %6d  %s\n", peak[nm]/1024, maxn[nm], nm }
         ' "$dir/procs.csv" | sort -k1 -nr | head -25
-        echo
-        echo "=== memory per build step ==="
-        echo "Peak RSS reached by each individual process, grouped by what it was doing."
-        echo "Size job pools off p95, not the mean — the mean hides the file that kills you."
-        printf '%-10s %7s %9s %9s %9s %9s\n' STEP PROCS MEAN_MB P50_MB P95_MB MAX_MB
-        awk -F, '
-            NR>1 {
-                pid = $2
-                if ($5 != "") { gen[pid]++; role[pid] = ($7 == "" ? "other" : $7) }
-                key = pid ":" gen[pid]
-                if ($3 + 0 > peak[key]) peak[key] = $3 + 0
-                who[key] = role[pid]
-            }
-            END { for (k in peak) print who[k], peak[k] }
-        ' "$dir/procs.csv" | sort -k1,1 -k2,2n | awk '
-            { v[$1, ++c[$1]] = $2 + 0; s[$1] += $2 }
-            END {
-                for (r in c) {
-                    n = c[r]
-                    p50 = v[r, int((n + 1) / 2)]
-                    p95 = v[r, int(n * 0.95) < 1 ? 1 : int(n * 0.95)]
-                    printf "%-10s %7d %9.1f %9.1f %9.1f %9.1f\n",
-                        r, n, s[r] / n / 1024, p50 / 1024, p95 / 1024, v[r, n] / 1024
-                }
-            }' | sort -k5 -nr
-
-        echo
-        echo "=== how much of the machine each step held at once ==="
-        printf '%-10s %13s %13s %9s %9s\n' STEP MEAN_TOTAL_GB PEAK_TOTAL_GB MEAN_N PEAK_N
-        awk -F, '
-            NR>1 {
-                pid = $2
-                if ($5 != "") role[pid] = ($7 == "" ? "other" : $7)
-                r = role[pid]
-                sum[$1, r] += $3; cnt[$1, r]++
-                seen[$1] = 1; roles[r] = 1
-            }
-            END {
-                for (e in seen) samples++
-                for (k in sum) {
-                    split(k, a, SUBSEP); r = a[2]
-                    tot[r] += sum[k]; num[r] += cnt[k]
-                    if (sum[k] > pt[r]) pt[r] = sum[k]
-                    if (cnt[k] > pn[r]) pn[r] = cnt[k]
-                }
-                for (r in roles)
-                    printf "%-10s %13.2f %13.2f %9.1f %9d\n",
-                        r, tot[r] / samples / 1048576, pt[r] / 1048576,
-                        num[r] / samples, pn[r]
-            }' "$dir/procs.csv" | sort -k3 -nr
     fi
 }
 
@@ -182,7 +195,7 @@ fi
 
 if [[ -z $OUTDIR ]]; then
     printf -v _stamp '%(%Y%m%d-%H%M%S)T' -1
-    OUTDIR="/tmp/memwatch-$_stamp"
+    OUTDIR="./memwatch-$_stamp"
 fi
 mkdir -p "$OUTDIR" || exit 1
 
@@ -210,6 +223,7 @@ fi
     echo "nproc:     $(nproc 2>/dev/null)"
     echo "page_kb:   $PAGE_KB"
     echo "interval:  ${INTERVAL}s   min_rss: $((MIN_RSS_KB/1024))MB   cap: $CAP   alert: ${ALERT_PCT}%"
+    echo "probe_mb:  $((PROBE_KB/1024))"
     echo "metric:    $( ((USE_PSS)) && echo PSS || echo RSS )"
     echo "ulimit -v: $(ulimit -v)"
     echo "ulimit -m: $(ulimit -m)"
@@ -226,8 +240,10 @@ fi
 
 exec 3>>"$OUTDIR/system.csv"
 exec 4>>"$OUTDIR/procs.csv"
-[[ -s $OUTDIR/system.csv ]] || printf 'iso,epoch,mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,swap_total_kb,swap_free_kb,committed_kb,cgroup_cur_kb,cgroup_max_kb,load1,procs_running,low,shmem_kb,slab_kb,sreclaimable_kb,sunreclaim_kb,pagetables_kb,kernelstack_kb,anon_kb,mapped_kb,hugetlb_kb,procs_logged,metric\n' >&3
-[[ -s $OUTDIR/procs.csv ]]  || printf 'epoch,pid,rss_kb,vsz_kb,comm,ppid,role,cmdline\n' >&4
+exec 5>>"$OUTDIR/exits.csv"
+[[ -s $OUTDIR/system.csv ]] || printf 'iso,epoch,mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,swap_total_kb,swap_free_kb,committed_kb,cgroup_cur_kb,cgroup_max_kb,load1,procs_running,low,shmem_kb,slab_kb,sreclaimable_kb,sunreclaim_kb,pagetables_kb,kernelstack_kb,anon_kb,mapped_kb,hugetlb_kb,procs_logged,metric,mem_avail_after_kb,scan_ms,exits_n,exits_kb,starts_n,dirty_kb,writeback_kb,kreclaimable_kb,percpu_kb,vmalloc_kb,swapcached_kb,secpagetables_kb\n' >&3
+[[ -s $OUTDIR/procs.csv ]]  || printf 'epoch,pid,rss_kb,vsz_kb,hwm_kb,swap_kb,comm,ppid,cmdline\n' >&4
+[[ -s $OUTDIR/exits.csv ]]  || printf 'epoch,pid,ppid,comm,last_rss_kb,hwm_kb,first_seen,lifetime_s,cmdline\n' >&5
 
 # fork-free sleep: block on an empty fifo with a read timeout
 HAVE_FIFO=0
@@ -241,20 +257,26 @@ nap() { if ((HAVE_FIFO)); then read -r -t "$1" -u 8 _ || :; else sleep "$1"; fi;
 HAVE_MAPFILE_D=0
 (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) && HAVE_MAPFILE_D=1
 
-declare -A SEEN   # pid -> comm, so a pid's identity is written just once
-declare -A ROLE   # pid -> compile/link/archive/..., inherited by children
+declare -A SEEN    # pid -> comm, so a pid's identity is written just once
+declare -A LAST    # pid -> RSS at the previous sample
+declare -A CURR    # pid -> RSS at this sample
+declare -A FIRST   # pid -> epoch first seen
+declare -A HWM     # pid -> peak RSS reported by the kernel
+declare -A PPIDOF  # pid -> parent
+declare -A CMDOF   # pid -> cmdline
 
 MIN_AVAIL=999999999
 MIN_AVAIL_AT=""
 SAMPLES=0
 ROWS=0
+EXITS=0
 RUNNING=1
 trap 'RUNNING=0' INT TERM
 
 finish() {
-    exec 3>&- 4>&-
+    exec 3>&- 4>&- 5>&-
     echo
-    echo "memwatch: $SAMPLES samples, $ROWS process rows -> $OUTDIR"
+    echo "memwatch: $SAMPLES samples, $ROWS process rows, $EXITS exits -> $OUTDIR"
     [[ -n $MIN_AVAIL_AT ]] &&
         echo "memwatch: lowest MemAvailable was $(( MIN_AVAIL / 1024 )) MB at $MIN_AVAIL_AT"
     echo "memwatch: analyze with  $0 --report $OUTDIR"
@@ -262,6 +284,56 @@ finish() {
 trap finish EXIT
 
 # ---------------------------------------------------------------- helpers
+
+# Milliseconds without forking. EPOCHREALTIME is bash 5+.
+now_ms() {
+    local t s us
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        t=${EPOCHREALTIME/,/.}
+        s=${t%.*}; us=${t#*.}
+        MS=$(( s * 1000 + 10#${us:0:3} ))
+    else
+        printf -v s '%(%s)T' -1
+        MS=$(( s * 1000 ))
+    fi
+}
+
+read_meminfo() {
+    mem_total=0 mem_avail=0 mem_free=0 buffers=0 cached=0
+    swap_total=0 swap_free=0 committed=0 shmem=0 slab=0 sreclaim=0
+    sunreclaim=0 pagetables=0 kstack=0 anon=0 mapped=0 hugetlb=0
+    dirty=0 writeback=0 kreclaim=0 percpu=0 vmalloc=0 swapcached=0 secpgt=0
+    local key val
+    while IFS=$': \t' read -r key val _; do
+        case $key in
+            MemTotal)      mem_total=$val ;;
+            MemFree)       mem_free=$val ;;
+            MemAvailable)  mem_avail=$val ;;
+            Buffers)       buffers=$val ;;
+            Cached)        cached=$val ;;
+            SwapTotal)     swap_total=$val ;;
+            SwapFree)      swap_free=$val ;;
+            SwapCached)    swapcached=$val ;;
+            Committed_AS)  committed=$val ;;
+            Shmem)         shmem=$val ;;
+            Slab)          slab=$val ;;
+            SReclaimable)  sreclaim=$val ;;
+            SUnreclaim)    sunreclaim=$val ;;
+            KReclaimable)  kreclaim=$val ;;
+            PageTables)    pagetables=$val ;;
+            SecPageTables) secpgt=$val ;;
+            KernelStack)   kstack=$val ;;
+            AnonPages)     anon=$val ;;
+            Mapped)        mapped=$val ;;
+            Hugetlb)       hugetlb=$val ;;
+            Dirty)         dirty=$val ;;
+            Writeback)     writeback=$val ;;
+            Percpu)        percpu=$val ;;
+            VmallocUsed)   vmalloc=$val ;;
+        esac
+    done < /proc/meminfo
+    (( mem_avail == 0 )) && mem_avail=$(( mem_free + buffers + cached ))
+}
 
 # ppid without forking; the comm field in /proc/PID/stat may contain ') '
 get_ppid() {
@@ -272,75 +344,12 @@ get_ppid() {
     PPID_OUT=${2:-0}
 }
 
-# Work out what build step a process belongs to.
-#
-# `comm` is capped at 15 characters by the kernel, so a toolchain-prefixed
-# binary like x86_64-linux-gnu-g++-13 arrives truncated and unrecognisable.
-# argv[0] is not truncated, so match on that first. A gcc/g++ driver is a
-# compile or a link depending only on its arguments, and the helpers it forks
-# (cc1plus, collect2, ld, lto1) inherit the answer through their parent.
-classify() {
-    local comm=$1 cmd=$2 ppid=$3 prog spaced
-    prog=${cmd%% *}
-    prog=${prog##*/}
-
-    case $prog in
-        cc1plus|cc1|cc1obj|cc1objplus|f951) ROLE_OUT=compile; return ;;
-        lto1|lto-wrapper)                   ROLE_OUT=link;    return ;;
-        collect2|ld|ld.bfd|ld.gold|ld.lld|lld|gold|mold|wild) ROLE_OUT=link; return ;;
-        ar|ranlib|llvm-ar|llvm-ranlib)      ROLE_OUT=archive; return ;;
-        as|gas|llvm-as)                     ROLE_OUT=assemble; return ;;
-        strip|objcopy|dsymutil)             ROLE_OUT=postlink; return ;;
-    esac
-    case $comm in
-        cc1plus|cc1|lto1) ROLE_OUT=compile; [[ $comm == lto1 ]] && ROLE_OUT=link; return ;;
-        collect2|ld|ld.bfd|ld.gold|ld.lld|lld|mold) ROLE_OUT=link; return ;;
-    esac
-
-    # a driver: the arguments decide. pad so " -c " matches at either end.
-    case $prog in
-        *gcc*|*g++*|*clang*|*c++|cc|ccache|distcc|sccache|*-ld|ld*)
-            spaced=" $cmd "
-            case $spaced in
-                *" -c "*|*" -S "*|*" -fsyntax-only "*) ROLE_OUT=compile; return ;;
-                *" -E "*)                              ROLE_OUT=preprocess; return ;;
-                *" -shared "*|*" -Wl,"*|*" -o "*.so*|*" -o "*.a\ *|*.o\ *)
-                                                       ROLE_OUT=link; return ;;
-            esac
-            ;;
-    esac
-
-    # a wrapper or interpreter may sit in front of the real tool: ccache,
-    # distcc, or a shell/python wrapper script. Look a few arguments in.
-    set -f
-    local tok i=0
-    for tok in $cmd; do
-        (( i++ > 4 )) && break
-        tok=${tok##*/}
-        case $tok in
-            cc1plus|cc1|cc1obj|cc1objplus|f951) set +f; ROLE_OUT=compile; return ;;
-            lto1)                               set +f; ROLE_OUT=link;    return ;;
-            collect2|ld|ld.bfd|ld.gold|ld.lld|lld|mold|gold) set +f; ROLE_OUT=link; return ;;
-            ar|ranlib|llvm-ar)                  set +f; ROLE_OUT=archive; return ;;
-            as|gas)                             set +f; ROLE_OUT=assemble; return ;;
-        esac
-    done
-    set +f
-
-    # otherwise take the parent's step, so wrappers and shells don't orphan
-    # their children into "other"
-    case ${ROLE[$ppid]:-} in
-        compile|link|archive|assemble|postlink) ROLE_OUT=${ROLE[$ppid]}; return ;;
-    esac
-    ROLE_OUT=other
-}
-
 # Append one process row to $batch. comm/ppid/cmdline are written only when the
 # pid is new (or has been recycled onto a different program), which is most of
 # the row width — without it, logging every process triples the log size.
 emit_row() {
     local pid=$1 rss_pages=$2 vsz_pages=$3
-    local kb comm cmd line key val
+    local kb comm cmd line key val hwm="" vmswap=""
 
     if (( USE_PSS )); then
         kb=0
@@ -352,12 +361,28 @@ emit_row() {
         kb=$(( rss_pages * PAGE_KB ))
     fi
 
+    # For anything big, read status as well: VmHWM is the high-water mark, so
+    # a process that peaked and shrank between two ticks still reports its
+    # true maximum, and VmSwap catches what has been pushed out of RAM.
+    if (( kb >= PROBE_KB )); then
+        while IFS=$': \t' read -r key val _; do
+            case $key in
+                VmHWM)  hwm=$val ;;
+                VmSwap) vmswap=$val; break ;;
+            esac
+        done < "/proc/$pid/status" 2>/dev/null
+    fi
+
     comm=""
     read -r comm < "/proc/$pid/comm" 2>/dev/null || return
     comm=${comm//,/_}
 
+    CURR[$pid]=$kb
+    [[ -v FIRST[$pid] ]] || FIRST[$pid]=$epoch
+    [[ -n $hwm ]] && HWM[$pid]=$hwm
+
     if [[ ${SEEN[$pid]:-} == "$comm" ]]; then
-        printf -v line '%s,%s,%s,%s,,,,\n' "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))"
+        printf -v line '%s,%s,%s,%s,%s,%s,,,\n' "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))" "$hwm" "$vmswap"
     else
         SEEN[$pid]=$comm
         cmd=""
@@ -369,12 +394,12 @@ emit_row() {
         cmd=${cmd//$'\n'/ }
         cmd=${cmd//$'\t'/ }
         cmd=${cmd//\"/\'}
-        (( ${#cmd} > 2048 )) && cmd="${cmd:0:2048}..."
+        (( ${#cmd} > 300 )) && cmd="${cmd:0:300}..."
         get_ppid "$pid"
-        classify "$comm" "$cmd" "$PPID_OUT"
-        ROLE[$pid]=$ROLE_OUT
-        printf -v line '%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
-            "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))" "$comm" "$PPID_OUT" "$ROLE_OUT" "$cmd"
+        PPIDOF[$pid]=$PPID_OUT
+        CMDOF[$pid]=$cmd
+        printf -v line '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+            "$epoch" "$pid" "$kb" "$(( vsz_pages * PAGE_KB ))" "$hwm" "$vmswap" "$comm" "$PPID_OUT" "$cmd"
     fi
 
     batch+=$line
@@ -390,31 +415,7 @@ while (( RUNNING )); do
     printf -v epoch '%(%s)T' -1
     printf -v iso '%(%Y-%m-%dT%H:%M:%S)T' -1
 
-    mem_total=0 mem_avail=0 mem_free=0 buffers=0 cached=0
-    swap_total=0 swap_free=0 committed=0 shmem=0 slab=0 sreclaim=0
-    sunreclaim=0 pagetables=0 kstack=0 anon=0 mapped=0 hugetlb=0
-    while IFS=$': \t' read -r key val _; do
-        case $key in
-            MemTotal)     mem_total=$val ;;
-            MemFree)      mem_free=$val ;;
-            MemAvailable) mem_avail=$val ;;
-            Buffers)      buffers=$val ;;
-            Cached)       cached=$val ;;
-            SwapTotal)    swap_total=$val ;;
-            SwapFree)     swap_free=$val ;;
-            Committed_AS) committed=$val ;;
-            Shmem)        shmem=$val ;;
-            Slab)         slab=$val ;;
-            SReclaimable) sreclaim=$val ;;
-            SUnreclaim)   sunreclaim=$val ;;
-            PageTables)   pagetables=$val ;;
-            KernelStack)  kstack=$val ;;
-            AnonPages)    anon=$val ;;
-            Mapped)       mapped=$val ;;
-            Hugetlb)      hugetlb=$val ;;
-        esac
-    done < /proc/meminfo
-    (( mem_avail == 0 )) && mem_avail=$(( mem_free + buffers + cached ))
+    read_meminfo
 
     cg_cur=0 cg_max=0
     if [[ -n $CG_CUR ]]; then
@@ -432,15 +433,16 @@ while (( RUNNING )); do
     (( cg_max > 0 && cg_cur * 100 / cg_max > 100 - ALERT_PCT )) && low=1
 
     # ---- every process with resident memory, batched into one write
+    now_ms; scan_start=$MS
     batch=""
     count=0
+    CURR=()
     if (( CAP )); then
         c_rss=() c_pid=() c_vsz=()
         floor=0 n=0
     fi
 
     for statm in /proc/[0-9]*/statm; do
-        [-r "$statm" ] || continue
         read -r vsz rss _ < "$statm" 2>/dev/null || continue
         (( rss > 0 && rss >= MIN_RSS_PAGES )) || continue
         pid=${statm#/proc/}; pid=${pid%/statm}
@@ -469,13 +471,47 @@ while (( RUNNING )); do
     fi
 
     [[ -n $batch ]] && printf '%s' "$batch" >&4
+    now_ms; scan_ms=$(( MS - scan_start ))
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    # meminfo again, on the far side of the walk. The walk is not instant, so a
+    # process that exits partway through was counted in the reading taken
+    # before it but appears in no process row. The two readings bracket the
+    # truth; the difference is exactly the churn that would otherwise show up
+    # as "unaccounted".
+    mem_avail_before=$mem_avail
+    read_meminfo
+    mem_avail_after=$mem_avail
+    mem_avail=$mem_avail_before
+
+    # ---- who disappeared since the last tick, and how big were they
+    exits_n=0
+    exits_kb=0
+    for _p in "${!LAST[@]}"; do
+        if [[ ! -v CURR[$_p] ]]; then
+            (( exits_n++ ))
+            exits_kb=$(( exits_kb + LAST[$_p] ))
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+                "$epoch" "$_p" "${PPIDOF[$_p]:-0}" "${SEEN[$_p]:-?}" \
+                "${LAST[$_p]}" "${HWM[$_p]:-}" "${FIRST[$_p]:-0}" \
+                "$(( epoch - ${FIRST[$_p]:-epoch} ))" "${CMDOF[$_p]:-}" >&5
+            unset "SEEN[$_p]" "FIRST[$_p]" "HWM[$_p]" "PPIDOF[$_p]" "CMDOF[$_p]" "LAST[$_p]"
+        fi
+    done
+    starts_n=0
+    for _p in "${!CURR[@]}"; do
+        [[ -v LAST[$_p] ]] || (( starts_n++ ))
+        LAST[$_p]=${CURR[$_p]}
+    done
+    EXITS=$(( EXITS + exits_n ))
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$iso" "$epoch" "$mem_total" "$mem_avail" "$mem_free" "$buffers" "$cached" \
         "$swap_total" "$swap_free" "$committed" "$cg_cur" "$cg_max" "$l1" "$procs_running" "$low" \
         "$shmem" "$slab" "$sreclaim" "$sunreclaim" "$pagetables" "$kstack" \
         "$anon" "$mapped" "$hugetlb" "$count" \
-        "$( ((USE_PSS)) && echo pss || echo rss )" >&3
+        "$( ((USE_PSS)) && echo pss || echo rss )" \
+        "$mem_avail_after" "$scan_ms" "$exits_n" "$exits_kb" "$starts_n" \
+        "$dirty" "$writeback" "$kreclaim" "$percpu" "$vmalloc" "$swapcached" "$secpgt" >&3
 
     if (( mem_avail < MIN_AVAIL )); then MIN_AVAIL=$mem_avail; MIN_AVAIL_AT=$iso; fi
     (( SAMPLES++ ))
